@@ -1,0 +1,25 @@
+[package]
+name = "tftp-rs"
+version = "0.0.1"
+edition = "2024"
+description = "A high-performance TFTP server with a TUI dashboard"
+license = "MIT"
+authors = ["Mateusz Hajder"]
+readme = "README.md"
+repository = "https://github.com/mhajder/tftp-rs"
+keywords = ["TFTP", "server", "TUI", "dashboard", "Rust"]
+categories = ["network-programming", "command-line-utilities", "command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0.101"
+axum = "0.8.8"
+clap = { version = "4.5.58", features = ["derive"] }
+crossterm = "0.29"
+if-addrs = "0.15"
+ratatui = "0.30"
+socket2 = "0.6.2"
+tokio = { version = "1.49.0", features = ["full"] }
+tokio-util = { version = "0.7.18", features = ["io"] }
+
+[dev-dependencies]
+tempfile = "3"
