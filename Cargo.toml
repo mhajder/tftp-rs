@@ -13,7 +13,7 @@ categories = ["network-programming", "command-line-utilities", "command-line-uti
 [dependencies]
 anyhow = "1.0.101"
 axum = "0.8.8"
-clap = { version = "4.5.58", features = ["derive"] }
+clap = { version = "4.5.60", features = ["derive"] }
 crossterm = "0.29"
 if-addrs = "0.15"
 ratatui = "0.30"
