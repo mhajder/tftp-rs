@@ -19,7 +19,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::{mpsc, watch};
 
-use server::ServerEvent;
+use server::{ServerConfig, ServerEvent};
 use ui::App;
 
 /// A high-performance TFTP server with a TUI dashboard.
@@ -41,6 +41,39 @@ struct Cli {
     /// Enable HTTP file server on the specified port. Shares the same directory as TFTP.
     #[arg(long)]
     http_port: Option<u16>,
+
+    /// Reply timeout in milliseconds. Lower values speed up transfers in
+    /// unstable environments at the cost of more retransmissions.
+    #[arg(short, long, default_value_t = 500)]
+    timeout: u64,
+
+    /// Maximum block size (blksize) to negotiate with clients. Useful when
+    /// accessing clients through a VPN with limited MTU. 0 = OS-detected max.
+    #[arg(long, default_value_t = 0)]
+    max_block_size: usize,
+
+    /// Maximum window size (RFC 7440) to negotiate with clients.
+    /// Higher values improve throughput on high-latency links.
+    /// 1 = classic stop-and-wait (disable windowing).
+    #[arg(short = 'w', long, default_value_t = 1)]
+    max_window_size: u16,
+
+    /// Allow overwriting existing files on WRQ (upload). When disabled,
+    /// uploads for existing files are rejected with an error.
+    #[arg(long, default_value_t = true)]
+    allow_overwrite: bool,
+
+    /// Maximum number of retransmission attempts before giving up.
+    #[arg(long, default_value_t = 10)]
+    max_retries: u32,
+
+    /// Disable read (RRQ) requests. Only uploads will be accepted.
+    #[arg(long)]
+    disable_read: bool,
+
+    /// Disable write (WRQ) requests. Only downloads will be accepted.
+    #[arg(long)]
+    disable_write: bool,
 }
 
 #[tokio::main]
@@ -66,12 +99,24 @@ async fn main() -> Result<()> {
     // Clone shutdown receiver for HTTP server before TFTP server consumes it.
     let http_shutdown_rx = shutdown_rx.clone();
 
+    // Build server configuration from CLI args.
+    let server_config = ServerConfig {
+        timeout_ms: cli.timeout,
+        max_block_size: cli.max_block_size,
+        max_window_size: cli.max_window_size,
+        allow_overwrite: cli.allow_overwrite,
+        max_retries: cli.max_retries,
+        enable_read: !cli.disable_read,
+        enable_write: !cli.disable_write,
+    };
+
     // Spawn the TFTP server in the background.
     let server_handle = {
         let dir = dir.clone();
         let tx = ev_tx.clone();
+        let cfg = server_config.clone();
         tokio::spawn(async move {
-            if let Err(e) = server::run(cli.port, dir, tx.clone(), shutdown_rx).await {
+            if let Err(e) = server::run(cli.port, dir, tx.clone(), shutdown_rx, cfg).await {
                 let _ = tx.send(ServerEvent::Log(format!("Server fatal: {e}")));
             }
         })
