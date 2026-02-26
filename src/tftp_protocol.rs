@@ -18,6 +18,15 @@ pub const BLOCK_SIZE: usize = 512;
 /// common convention is 65464).
 pub const MAX_BLKSIZE: usize = 65464;
 
+/// Default window size (RFC 7440). A window of 1 behaves like classic TFTP.
+pub const DEFAULT_WINDOWSIZE: u16 = 1;
+
+/// Minimum timeout value (seconds) per RFC 2349.
+pub const MIN_TIMEOUT: u8 = 1;
+
+/// Maximum timeout value (seconds) per RFC 2349.
+pub const MAX_TIMEOUT: u8 = 255;
+
 /// A fully parsed TFTP packet.
 #[derive(Debug, Clone)]
 #[allow(clippy::upper_case_acronyms)]
@@ -245,6 +254,182 @@ fn encode_request(
     buf
 }
 
+// ---------------------------------------------------------------------------
+// Netascii conversion (RFC 1350)
+// ---------------------------------------------------------------------------
+
+/// State tracker for netascii-to-octet conversion across block boundaries.
+/// Netascii encodes: `\r\n` → LF, `\r\0` → CR. A bare `\r` at the end of a
+/// block might be followed by `\n` or `\0` in the next block, so we must
+/// remember the trailing `\r`.
+#[derive(Debug, Default)]
+pub struct NetasciiDecoder {
+    /// True if the previous block ended with `\r` that hasn't been resolved yet.
+    pub pending_cr: bool,
+}
+
+impl NetasciiDecoder {
+    pub fn new() -> Self {
+        Self { pending_cr: false }
+    }
+
+    /// Convert a netascii-encoded chunk to octet (binary) data.
+    /// Updates internal state to handle `\r` spanning block boundaries.
+    pub fn decode(&mut self, input: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(input.len());
+        let mut i = 0;
+
+        // Handle pending CR from previous block.
+        if self.pending_cr {
+            self.pending_cr = false;
+            if !input.is_empty() {
+                match input[0] {
+                    b'\n' => {
+                        out.push(b'\n'); // \r\n → \n
+                        i = 1;
+                    }
+                    0 => {
+                        out.push(b'\r'); // \r\0 → \r
+                        i = 1;
+                    }
+                    _ => {
+                        out.push(b'\r'); // bare \r
+                    }
+                }
+            } else {
+                out.push(b'\r');
+            }
+        }
+
+        while i < input.len() {
+            if input[i] == b'\r' {
+                if i + 1 < input.len() {
+                    match input[i + 1] {
+                        b'\n' => {
+                            out.push(b'\n');
+                            i += 2;
+                        }
+                        0 => {
+                            out.push(b'\r');
+                            i += 2;
+                        }
+                        _ => {
+                            out.push(b'\r');
+                            i += 1;
+                        }
+                    }
+                } else {
+                    // \r at end of block — defer until next block.
+                    self.pending_cr = true;
+                    i += 1;
+                }
+            } else {
+                out.push(input[i]);
+                i += 1;
+            }
+        }
+
+        out
+    }
+}
+
+/// State tracker for octet-to-netascii conversion across block boundaries.
+/// We need to expand `\n` → `\r\n` and `\r` → `\r\0`.
+/// When a conversion causes the output to exceed `blksize`, overflow bytes
+/// are stored and prepended to the next block.
+#[derive(Debug, Default)]
+pub struct NetasciiEncoder {
+    /// Overflow bytes that didn't fit in the previous block.
+    pub overflow: Vec<u8>,
+}
+
+impl NetasciiEncoder {
+    pub fn new() -> Self {
+        Self {
+            overflow: Vec::new(),
+        }
+    }
+
+    /// Encode octet (binary) data to netascii, respecting `blksize`.
+    /// Returns the encoded block (may be smaller or equal to blksize).
+    /// Any overflow is stored internally and will be prepended to the next call.
+    pub fn encode(&mut self, input: &[u8], blksize: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(blksize);
+
+        // First, emit any overflow from previous block.
+        if !self.overflow.is_empty() {
+            let drain: Vec<u8> = std::mem::take(&mut self.overflow);
+            for &b in &drain {
+                if out.len() >= blksize {
+                    self.overflow.push(b);
+                } else {
+                    out.push(b);
+                }
+            }
+        }
+
+        for &b in input {
+            if out.len() >= blksize {
+                // All remaining input goes to overflow, but still needs conversion.
+                self.overflow_encode_byte(b);
+            } else {
+                match b {
+                    b'\n' => {
+                        out.push(b'\r');
+                        if out.len() >= blksize {
+                            self.overflow.push(b'\n');
+                        } else {
+                            out.push(b'\n');
+                        }
+                    }
+                    b'\r' => {
+                        out.push(b'\r');
+                        if out.len() >= blksize {
+                            self.overflow.push(0);
+                        } else {
+                            out.push(0);
+                        }
+                    }
+                    _ => out.push(b),
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Check if there is buffered overflow data remaining.
+    pub fn has_overflow(&self) -> bool {
+        !self.overflow.is_empty()
+    }
+
+    /// Drain remaining overflow into a final block.
+    pub fn drain_overflow(&mut self, blksize: usize) -> Vec<u8> {
+        let drain = std::mem::take(&mut self.overflow);
+        if drain.len() <= blksize {
+            drain
+        } else {
+            // Extremely unlikely but handle gracefully.
+            self.overflow = drain[blksize..].to_vec();
+            drain[..blksize].to_vec()
+        }
+    }
+
+    fn overflow_encode_byte(&mut self, b: u8) {
+        match b {
+            b'\n' => {
+                self.overflow.push(b'\r');
+                self.overflow.push(b'\n');
+            }
+            b'\r' => {
+                self.overflow.push(b'\r');
+                self.overflow.push(0);
+            }
+            _ => self.overflow.push(b),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,5 +524,63 @@ mod tests {
             }
             _ => panic!("expected OACK"),
         }
+    }
+
+    #[test]
+    fn netascii_decode_crlf() {
+        let mut dec = NetasciiDecoder::new();
+        let input = b"hello\r\nworld\r\n";
+        let output = dec.decode(input);
+        assert_eq!(output, b"hello\nworld\n");
+    }
+
+    #[test]
+    fn netascii_decode_cr_nul() {
+        let mut dec = NetasciiDecoder::new();
+        let input = b"foo\r\0bar";
+        let output = dec.decode(input);
+        assert_eq!(output, b"foo\rbar");
+    }
+
+    #[test]
+    fn netascii_decode_split_cr() {
+        let mut dec = NetasciiDecoder::new();
+        // \r at end of first block, \n at start of second
+        let out1 = dec.decode(b"abc\r");
+        let out2 = dec.decode(b"\ndef");
+        let mut combined = out1;
+        combined.extend_from_slice(&out2);
+        assert_eq!(combined, b"abc\ndef");
+    }
+
+    #[test]
+    fn netascii_encode_basic() {
+        let mut enc = NetasciiEncoder::new();
+        let input = b"hello\nworld\n";
+        let output = enc.encode(input, 512);
+        assert_eq!(output, b"hello\r\nworld\r\n");
+        assert!(!enc.has_overflow());
+    }
+
+    #[test]
+    fn netascii_encode_cr() {
+        let mut enc = NetasciiEncoder::new();
+        let input = b"foo\rbar";
+        let output = enc.encode(input, 512);
+        assert_eq!(output, b"foo\r\0bar");
+    }
+
+    #[test]
+    fn netascii_encode_overflow() {
+        let mut enc = NetasciiEncoder::new();
+        // Block size of 5: "ab\n" encodes to "ab\r\n" (4 bytes), then "c" = 5 bytes.
+        // After that "d\n" would need "d\r\n" (3 bytes) overflowing.
+        let input = b"ab\ncd\n";
+        let out1 = enc.encode(input, 5);
+        assert_eq!(out1.len(), 5);
+        assert_eq!(out1, b"ab\r\nc");
+        assert!(enc.has_overflow());
+        let out2 = enc.drain_overflow(512);
+        assert_eq!(out2, b"d\r\n");
     }
 }
