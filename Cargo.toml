@@ -1,6 +1,6 @@
 [package]
 name = "tftp-rs"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "A high-performance TFTP server with a TUI dashboard"
 license = "MIT"
