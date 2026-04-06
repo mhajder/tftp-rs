@@ -8,7 +8,7 @@ authors = ["Mateusz Hajder"]
 readme = "README.md"
 repository = "https://github.com/mhajder/tftp-rs"
 keywords = ["TFTP", "server", "TUI", "dashboard", "Rust"]
-categories = ["network-programming", "command-line-utilities", "command-line-utilities"]
+categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.102"
