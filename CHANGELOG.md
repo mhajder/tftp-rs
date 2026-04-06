@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/mhajder/tftp-rs/compare/v0.3.0...v0.3.1) (2026-04-06)
+
+
+### 🐛 Bug Fixes
+
+* update crates.io publishing to use OIDC authentication via rust-lang/crates-io-auth-action ([#14](https://github.com/mhajder/tftp-rs/issues/14)) ([c33fb82](https://github.com/mhajder/tftp-rs/commit/c33fb821fcaf69d73e814612c371859964b649e7))
+
 ## [0.3.0](https://github.com/mhajder/tftp-rs/compare/v0.2.0...v0.3.0) (2026-04-06)
 
 
