@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/mhajder/tftp-rs/compare/v0.3.1...v0.3.2) (2026-04-06)
+
+
+### 🐛 Bug Fixes
+
+* crates.io authentication token for cargo publish in release workflow ([#16](https://github.com/mhajder/tftp-rs/issues/16)) ([26165ec](https://github.com/mhajder/tftp-rs/commit/26165eca20ed41d81db78727487d603c7b5708f5))
+
 ## [0.3.1](https://github.com/mhajder/tftp-rs/compare/v0.3.0...v0.3.1) (2026-04-06)
 
 
