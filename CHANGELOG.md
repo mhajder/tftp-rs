@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/mhajder/tftp-rs/compare/v0.2.0...v0.3.0) (2026-04-06)
+
+
+### 🚀 Features
+
+* add automated crates.io publishing workflow and clean up Cargo.toml categories ([#12](https://github.com/mhajder/tftp-rs/issues/12)) ([ee1e959](https://github.com/mhajder/tftp-rs/commit/ee1e959e5c17ca11a4a59f3c6b2f3ed028807d38))
+
 ## [0.2.0](https://github.com/mhajder/tftp-rs/compare/v0.1.0...v0.2.0) (2026-02-26)
 
 
