@@ -277,6 +277,20 @@ fn bind_udp_socket(
     interface: Option<&InterfaceBinding>,
     buffer_size: Option<usize>,
 ) -> Result<UdpSocket> {
+    let raw = bind_raw_udp_socket(local_addr, interface, buffer_size)?;
+    raw.set_nonblocking(true)?;
+
+    let std_sock: std::net::UdpSocket = raw.into();
+    Ok(UdpSocket::from_std(std_sock)?)
+}
+
+/// The `socket2` half of [`bind_udp_socket`], split out so a caller can open
+/// the same socket without a tokio runtime in scope.
+fn bind_raw_udp_socket(
+    local_addr: SocketAddr,
+    interface: Option<&InterfaceBinding>,
+    buffer_size: Option<usize>,
+) -> Result<socket2::Socket> {
     let domain = if local_addr.is_ipv6() {
         socket2::Domain::IPV6
     } else {
@@ -294,10 +308,8 @@ fn bind_udp_socket(
     }
 
     raw.bind(&local_addr.into())?;
-    raw.set_nonblocking(true)?;
 
-    let std_sock: std::net::UdpSocket = raw.into();
-    Ok(UdpSocket::from_std(std_sock)?)
+    Ok(raw)
 }
 
 /// Create a listening TCP socket on one local address, optionally constrained
@@ -321,6 +333,10 @@ pub fn bind_tcp_listener(
         socket2::Domain::IPV4
     };
     let raw = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    // Matches what std does for `TcpListener::bind`. On Windows SO_REUSEADDR
+    // lets an unrelated process bind an address already in use and steal
+    // connections, so it is deliberately left off there.
+    #[cfg(not(windows))]
     raw.set_reuse_address(true)?;
 
     if let Some(name) = interface {
@@ -556,6 +572,22 @@ pub async fn run(
 /// real work. On targets other than Linux and macOS this always fails.
 pub fn validate_interface(name: &str) -> Result<()> {
     InterfaceBinding::from_name(name).map(|_| ())
+}
+
+/// Check that the server could take `bind_addr`, optionally on `interface`.
+///
+/// Opens and immediately closes the same socket [`run`] and
+/// [`run_on_interface`] would, so a caller can report an unusable address or
+/// interface up front instead of discovering it once the server is already
+/// running in the background. Binding the real listener is a separate step,
+/// so the address can still be taken in between.
+///
+/// The interface is applied to the probe as well. Two servers on different
+/// interfaces may legitimately share one address and port, and a probe
+/// without the interface would wrongly reject the second one.
+pub fn validate_bind(bind_addr: SocketAddr, interface: Option<&str>) -> Result<()> {
+    let interface = interface.map(InterfaceBinding::from_name).transpose()?;
+    bind_raw_udp_socket(bind_addr, interface.as_ref(), None).map(|_| ())
 }
 
 /// Run the TFTP server on one local address and one named network interface.

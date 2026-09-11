@@ -28,7 +28,7 @@ tsize, windowsize), netascii mode, and an optional HTTP file server.
 - **Async I/O** -- built on `tokio` with non-blocking UDP sockets
 - **Ephemeral transfer sockets** -- each transfer gets its own OS-assigned port, keeping the main listener free
 - **Request deduplication** -- duplicate requests from the same peer are silently dropped while a transfer is already in progress
-- **Overwrite protection** -- WRQ for existing files can be rejected with `--no-allow-overwrite` (returns error code 6)
+- **Overwrite protection** -- WRQ for existing files can be rejected with `--allow-overwrite false` (returns error code 6)
 - **Access control** -- `--disable-read` or `--disable-write` to restrict what operations clients may perform
 - **Configurable retransmission** -- `--timeout` (ms) and `--max-retries` to tune behaviour for unstable networks
 - **HTTP file server** -- optional HTTP server for browser-based directory browsing and file downloads (`--http-port`)
@@ -109,7 +109,7 @@ Options:
   -t, --timeout <MS>                 Reply timeout in milliseconds [default: 500]
       --max-block-size <BYTES>       Max negotiable blksize (0 = OS auto-detect) [default: 0]
   -w, --max-window-size <N>          Max RFC 7440 window size (1 = disable) [default: 1]
-      --allow-overwrite              Allow overwriting existing files on WRQ [default: true]
+      --allow-overwrite <BOOL>       Allow overwriting existing files on WRQ [default: true]
       --max-retries <N>              Max retransmission attempts [default: 10]
       --disable-read                 Reject all RRQ (download) requests
       --disable-write                Reject all WRQ (upload) requests

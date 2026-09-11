@@ -54,10 +54,11 @@ impl App {
         dir: PathBuf,
         log_writer: Option<BufWriter<File>>,
     ) -> Self {
-        // Only a wildcard bind is reachable on every address, so that is the
+        // Only a wildcard bind reaches more than one address, so that is the
         // only case where enumerating the host's addresses tells the truth.
+        // Even then, --interface narrows it to that interface's addresses.
         let interface_ips = if bind.is_unspecified() {
-            get_interface_ips()
+            get_interface_ips(interface.as_deref())
         } else {
             Vec::new()
         };
@@ -84,7 +85,7 @@ impl App {
 
     pub fn refresh_interfaces_if_needed(&mut self) {
         if self.bind.is_unspecified() && self.last_ip_refresh.elapsed() >= IP_REFRESH_INTERVAL {
-            self.interface_ips = get_interface_ips();
+            self.interface_ips = get_interface_ips(self.interface.as_deref());
             self.last_ip_refresh = Instant::now();
         }
     }
@@ -164,11 +165,20 @@ fn timestamp_now() -> String {
 // Interface IP helper
 // ---------------------------------------------------------------------------
 
-fn get_interface_ips() -> Vec<String> {
+/// Addresses a wildcard-bound server actually answers on.
+///
+/// With `--interface` the socket option limits traffic to that interface, so
+/// only its addresses qualify. Loopback is filtered out only when no
+/// interface was named: asking for `lo0` and being told "none" would be
+/// worse than useless.
+fn get_interface_ips(interface: Option<&str>) -> Vec<String> {
     let mut ips: Vec<String> = if_addrs::get_if_addrs()
         .unwrap_or_default()
         .into_iter()
-        .filter(|iface| !iface.is_loopback())
+        .filter(|iface| match interface {
+            Some(name) => iface.name == name,
+            None => !iface.is_loopback(),
+        })
         .filter(|iface| iface.addr.ip().is_ipv4())
         .map(|iface| iface.addr.ip().to_string())
         .collect();

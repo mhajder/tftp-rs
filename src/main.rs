@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{
@@ -30,8 +30,9 @@ struct Cli {
     #[arg(long, default_value = "0.0.0.0")]
     bind: IpAddr,
 
-    /// Bind every TFTP socket to this network interface, for example eth0.
-    /// Linux and macOS only. An unknown interface aborts startup.
+    /// Bind every socket to this network interface, for example eth0. Covers
+    /// the HTTP file server too. Linux and macOS only. An unknown interface
+    /// aborts startup.
     #[arg(long)]
     interface: Option<String>,
 
@@ -69,7 +70,10 @@ struct Cli {
 
     /// Allow overwriting existing files on WRQ (upload). When disabled,
     /// uploads for existing files are rejected with an error.
-    #[arg(long, default_value_t = true)]
+    ///
+    /// Takes an explicit value, because the default is already true and a
+    /// bare flag could therefore never turn overwriting off.
+    #[arg(long, action = ArgAction::Set, default_value_t = true)]
     allow_overwrite: bool,
 
     /// Maximum number of retransmission attempts before giving up.
@@ -92,11 +96,13 @@ async fn main() -> Result<()> {
 
     // Fail before the dashboard takes over the terminal. A server error after
     // that point only reaches the user as a log line in the TUI.
-    if let Some(interface) = cli.interface.as_deref() {
-        server::validate_interface(interface)?;
-    }
-    std::net::UdpSocket::bind(tftp_addr)
+    server::validate_bind(tftp_addr, cli.interface.as_deref())
         .with_context(|| format!("cannot bind TFTP server to {tftp_addr}"))?;
+    if let Some(http_port) = cli.http_port {
+        let http_addr = SocketAddr::new(cli.bind, http_port);
+        server::bind_tcp_listener(http_addr, cli.interface.as_deref())
+            .with_context(|| format!("cannot bind HTTP server to {http_addr}"))?;
+    }
 
     let dir = std::fs::canonicalize(&cli.dir)?;
 
