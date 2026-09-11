@@ -944,7 +944,16 @@ async fn handle_rrq(
                         Packet::ERROR { code, msg } => {
                             return Err(anyhow!("client error {code}: {msg}"));
                         }
-                        _ => { /* retry */ }
+                        // Anything else leaves us no further forward, so it
+                        // counts against the retry budget exactly as silence
+                        // does. Otherwise a client that keeps answering with
+                        // the wrong packet keeps the server resending forever.
+                        _ => {
+                            retries += 1;
+                            if retries > max_retries {
+                                return Err(anyhow!("timeout waiting for OACK acknowledgment"));
+                            }
+                        }
                     }
                 }
                 Ok(Err(e)) => return Err(e.into()),
@@ -1041,12 +1050,25 @@ async fn handle_rrq(
                                     retries = 0;
                                     continue;
                                 }
-                                // ACK for wrong block, retry.
+                                // ACK for a block outside the window.
+                                retries += 1;
+                                if retries > max_retries {
+                                    return Err(anyhow!(
+                                        "no usable acknowledgment after {max_retries} attempts"
+                                    ));
+                                }
                             }
                             Packet::ERROR { code, msg } => {
                                 return Err(anyhow!("client error {code}: {msg}"));
                             }
-                            _ => {}
+                            _ => {
+                                retries += 1;
+                                if retries > max_retries {
+                                    return Err(anyhow!(
+                                        "no usable acknowledgment after {max_retries} attempts"
+                                    ));
+                                }
+                            }
                         }
                     }
                     Ok(Err(e)) => return Err(e.into()),
@@ -1096,7 +1118,18 @@ async fn handle_rrq(
                             Packet::ERROR { code, msg } => {
                                 return Err(anyhow!("client error {code}: {msg}"));
                             }
-                            _ => { /* duplicate / wrong block – resend */ }
+                            // A duplicate or out-of-range ACK means resend,
+                            // but it must not buy the client another attempt
+                            // for free: each 4-byte ACK can cost the server a
+                            // full block in reply.
+                            _ => {
+                                retries += 1;
+                                if retries > max_retries {
+                                    return Err(anyhow!(
+                                        "no acknowledgment for block {block_num} after {max_retries} attempts"
+                                    ));
+                                }
+                            }
                         }
                     }
                     Ok(Err(e)) => return Err(e.into()),
@@ -1381,14 +1414,29 @@ async fn handle_wrq(
                                 if block_num == expected_block.wrapping_sub(1)
                                     && window_data.is_empty() =>
                             {
-                                // Duplicate of previous block — re-ACK.
+                                // Duplicate of previous block — re-ACK, but
+                                // count it: a client replaying one block must
+                                // not hold the transfer open indefinitely.
+                                retries += 1;
+                                if retries > max_retries {
+                                    return Err(anyhow!(
+                                        "no new data after {max_retries} duplicate blocks"
+                                    ));
+                                }
                                 let ack = Packet::ACK { block_num };
                                 send_resilient(&sock, &ack.to_bytes()).await?;
                             }
                             Packet::ERROR { code, msg } => {
                                 return Err(anyhow!("client error {code}: {msg}"));
                             }
-                            _ => { /* ignore unexpected */ }
+                            _ => {
+                                retries += 1;
+                                if retries > max_retries {
+                                    return Err(anyhow!(
+                                        "no usable data after {max_retries} unexpected packets"
+                                    ));
+                                }
+                            }
                         }
                     }
                     Ok(Err(e)) => return Err(e.into()),
@@ -1458,17 +1506,31 @@ async fn handle_wrq(
                                 data_payload = data;
                                 break;
                             }
-                            // Duplicate of previous block – re-ACK it.
+                            // Duplicate of previous block – re-ACK it, and
+                            // count it against the retry budget.
                             Packet::DATA { block_num, .. }
                                 if block_num == expected_block.wrapping_sub(1) =>
                             {
+                                retries += 1;
+                                if retries > max_retries {
+                                    return Err(anyhow!(
+                                        "no new data after {max_retries} duplicate blocks"
+                                    ));
+                                }
                                 let ack = Packet::ACK { block_num };
                                 send_resilient(&sock, &ack.to_bytes()).await?;
                             }
                             Packet::ERROR { code, msg } => {
                                 return Err(anyhow!("client error {code}: {msg}"));
                             }
-                            _ => { /* ignore unexpected */ }
+                            _ => {
+                                retries += 1;
+                                if retries > max_retries {
+                                    return Err(anyhow!(
+                                        "no usable data after {max_retries} unexpected packets"
+                                    ));
+                                }
+                            }
                         }
                     }
                     Ok(Err(e)) => return Err(e.into()),
