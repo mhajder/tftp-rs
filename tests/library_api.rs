@@ -454,3 +454,105 @@ async fn a_request_for_a_missing_file_is_answered_with_an_error() {
     shutdown_tx.send(true).expect("shutdown signal");
     server.await.expect("server task").expect("server result");
 }
+
+#[tokio::test]
+async fn a_lost_oack_is_retransmitted_as_an_oack() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+
+    let reservation = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("reserve test port");
+    let listener_address = reservation.local_addr().expect("listener address");
+    drop(reservation);
+
+    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server_dir = dir.path().to_path_buf();
+    let server = tokio::spawn(async move {
+        run(
+            listener_address,
+            server_dir,
+            events,
+            shutdown_rx,
+            ServerConfig::default(),
+        )
+        .await
+    });
+
+    wait_until_listening(&mut event_rx).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    client
+        .send_to(
+            &wrq_with_options("up.txt", &[("blksize", "1024")]),
+            listener_address,
+        )
+        .await
+        .expect("WRQ");
+
+    let mut buffer = [0_u8; 1024];
+    let (_, from) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("OACK timeout")
+        .expect("datagram");
+    assert_eq!(
+        u16::from_be_bytes([buffer[0], buffer[1]]),
+        6,
+        "the first reply to an option request is an OACK"
+    );
+
+    // Drop it, as a lossy link would, and wait for the server to try again.
+    let (_, _) = tokio::time::timeout(Duration::from_secs(3), client.recv_from(&mut buffer))
+        .await
+        .expect("the server must retry")
+        .expect("datagram");
+    assert_eq!(
+        u16::from_be_bytes([buffer[0], buffer[1]]),
+        6,
+        "a retransmission must repeat the OACK, not fall back to ACK 0"
+    );
+
+    // Finish the upload at the negotiated block size.
+    let mut data = vec![0, 3, 0, 1];
+    data.extend_from_slice(b"body");
+    client.send_to(&data, from).await.expect("DATA 1");
+
+    let (_, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("ACK timeout")
+        .expect("datagram");
+    assert_eq!(&buffer[..4], &[0, 4, 0, 1], "block 1 acknowledged");
+
+    // The rename happens after the last ACK, on the transfer task.
+    let uploaded = dir.path().join("up.txt");
+    let body = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(body) = tokio::fs::read(&uploaded).await {
+                return body;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the upload must be promoted to its final name");
+    assert_eq!(body, b"body");
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
+
+fn wrq_with_options(filename: &str, options: &[(&str, &str)]) -> Vec<u8> {
+    let mut request = Vec::new();
+    request.extend_from_slice(&2_u16.to_be_bytes());
+    request.extend_from_slice(filename.as_bytes());
+    request.push(0);
+    request.extend_from_slice(b"octet");
+    request.push(0);
+    for (key, value) in options {
+        request.extend_from_slice(key.as_bytes());
+        request.push(0);
+        request.extend_from_slice(value.as_bytes());
+        request.push(0);
+    }
+    request
+}
