@@ -753,11 +753,11 @@ async fn run_inner(
                             let result = handle_wrq(TransferContext { id, peer, local_addr, interface: interface2, dir: dir2.clone(), tx: tx2.clone(), config: cfg }, &filename, &mode, &options).await;
                             rip.lock().await.remove(&peer);
                             if let Err(e) = result {
-                                // Clean up the incomplete .part file.
+                                // Clean up this transfer's staging file. The
+                                // id keeps it distinct from any other upload
+                                // of the same name that is still running.
                                 if let Ok(final_path) = sanitize_path(&dir2, &filename) {
-                                    let mut part = final_path.into_os_string();
-                                    part.push(".part");
-                                    let _ = tokio::fs::remove_file(PathBuf::from(part)).await;
+                                    let _ = tokio::fs::remove_file(part_path(&final_path, id)).await;
                                 }
                                 let _ = tx2.send(ServerEvent::TransferFailed { id, error: e.to_string() });
                                 let _ = tx2.send(ServerEvent::Log(format!("{peer}: WRQ error: {e}")));
@@ -778,6 +778,17 @@ async fn run_inner(
         }
     }
     Ok(())
+}
+
+/// Where an upload is staged before it is promoted to its final name.
+///
+/// The transfer id is part of the name so that two clients uploading the same
+/// filename at once cannot interleave their writes into one file, and so that
+/// a `.part` left behind by a killed server never blocks that filename again.
+fn part_path(path: &Path, id: u64) -> PathBuf {
+    let mut staged = path.as_os_str().to_owned();
+    staged.push(format!(".{id}.part"));
+    PathBuf::from(staged)
 }
 
 /// A request that failed before the transfer started, carrying the TFTP error
@@ -1354,28 +1365,11 @@ async fn handle_wrq(
     // Write to a temporary ".part" file so that incomplete uploads are
     // never mistaken for valid files.  On success we rename to the real
     // path; on failure the .part file is cleaned up.
-    let part_path = {
-        let mut p = path.as_os_str().to_owned();
-        p.push(".part");
-        PathBuf::from(p)
-    };
+    let part_path = part_path(&path, id);
 
-    let mut file = if config.allow_overwrite {
-        tokio::fs::File::create(&part_path).await?
-    } else {
-        tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&part_path)
-            .await
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    anyhow!("file already exists: {}", path.display())
-                } else {
-                    anyhow!("cannot create {}: {e}", path.display())
-                }
-            })?
-    };
+    let mut file = tokio::fs::File::create(&part_path)
+        .await
+        .map_err(|e| anyhow!("cannot create {}: {e}", part_path.display()))?;
 
     let mut transferred: u64 = 0;
     let mut expected_block: u16 = 1;
@@ -1585,13 +1579,44 @@ async fn handle_wrq(
     drop(file);
 
     // Atomically promote the completed .part file to its final name.
-    tokio::fs::rename(&part_path, &path).await.map_err(|e| {
-        anyhow!(
-            "failed to rename {} -> {}: {e}",
-            part_path.display(),
-            path.display()
-        )
-    })?;
+    if config.allow_overwrite {
+        tokio::fs::rename(&part_path, &path).await.map_err(|e| {
+            anyhow!(
+                "failed to rename {} -> {}: {e}",
+                part_path.display(),
+                path.display()
+            )
+        })?;
+    } else {
+        // rename() replaces the destination, which would silently overwrite a
+        // file that appeared while this upload was running. Linking fails if
+        // the destination exists, so the check and the create are one step.
+        // Both paths sit in the same directory, so the link cannot cross a
+        // filesystem boundary.
+        match tokio::fs::hard_link(&part_path, &path).await {
+            Ok(()) => {
+                let _ = tokio::fs::remove_file(&part_path).await;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                send_error(
+                    local_addr,
+                    interface.as_ref(),
+                    peer,
+                    6,
+                    "File already exists",
+                )
+                .await;
+                return Err(anyhow!("file already exists: {}", path.display()));
+            }
+            Err(e) => {
+                return Err(anyhow!(
+                    "failed to link {} -> {}: {e}",
+                    part_path.display(),
+                    path.display()
+                ));
+            }
+        }
+    }
 
     tx.send(ServerEvent::TransferComplete(id))?;
     tx.send(ServerEvent::Log(format!(
