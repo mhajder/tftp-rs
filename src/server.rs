@@ -1280,16 +1280,38 @@ async fn handle_wrq(
     let max_retries = config.max_retries;
 
     // Send OACK if we have negotiated options, then wait for first DATA.
-    if !oack_options.is_empty() {
+    let oack = if !oack_options.is_empty() {
         let oack_pkt = Packet::OACK {
             options: oack_options,
         };
-        send_resilient(&sock, &oack_pkt.to_bytes()).await?;
+        Some(oack_pkt.to_bytes())
+    } else {
+        None
+    };
+
+    if let Some(ref oack_bytes) = oack {
+        send_resilient(&sock, oack_bytes).await?;
     } else {
         // Send ACK 0 to acknowledge the WRQ.
         let ack0 = Packet::ACK { block_num: 0 };
         send_resilient(&sock, &ack0.to_bytes()).await?;
     }
+
+    // What to retransmit while waiting for the client. Until block 1 arrives,
+    // an OACK must be repeated as an OACK: replying ACK 0 instead would tell
+    // the client its options were refused, leaving it on 512-byte blocks while
+    // the server still expects the negotiated blksize. The server would then
+    // treat block 1 as the final short block and rename a truncated upload as
+    // a complete one.
+    let reacknowledge = |expected_block: u16| -> Vec<u8> {
+        match (&oack, expected_block) {
+            (Some(oack_bytes), 1) => oack_bytes.clone(),
+            _ => Packet::ACK {
+                block_num: expected_block.wrapping_sub(1),
+            }
+            .to_bytes(),
+        }
+    };
 
     // Ensure parent directories exist for subdirectory uploads.
     if let Some(parent) = path.parent() {
@@ -1382,11 +1404,7 @@ async fn handle_wrq(
                                 expected_block
                             ));
                         }
-                        // Re-send previous ACK.
-                        let prev = Packet::ACK {
-                            block_num: expected_block.wrapping_sub(1),
-                        };
-                        send_resilient(&sock, &prev.to_bytes()).await?;
+                        send_resilient(&sock, &reacknowledge(expected_block)).await?;
                     }
                 }
             }
@@ -1459,11 +1477,7 @@ async fn handle_wrq(
                         if retries > max_retries {
                             return Err(anyhow!("timeout waiting for DATA block {expected_block}"));
                         }
-                        // Re-send previous ACK.
-                        let prev = Packet::ACK {
-                            block_num: expected_block.wrapping_sub(1),
-                        };
-                        send_resilient(&sock, &prev.to_bytes()).await?;
+                        send_resilient(&sock, &reacknowledge(expected_block)).await?;
                     }
                 }
             }
