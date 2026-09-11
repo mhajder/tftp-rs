@@ -154,15 +154,27 @@ fn parse_request(buf: &[u8], is_rrq: bool) -> Result<Packet> {
         return Err(anyhow!("empty filename"));
     }
 
+    // RFC 1350 defines three modes. An unrecognised one must be refused
+    // rather than quietly served as octet: a client that asked for netascii
+    // and had its mode field truncated would otherwise receive unconverted
+    // bytes with nothing to indicate it.
+    if !matches!(mode.as_str(), "netascii" | "octet" | "mail") {
+        return Err(anyhow!("unsupported transfer mode '{mode}'"));
+    }
+
     // Parse RFC 2347 options (key-value pairs after mode).
     let mut options = HashMap::new();
     let mut i = 2;
     while i + 1 < fields.len() {
         let key = String::from_utf8(fields[i].to_vec())?.to_ascii_lowercase();
         let val = String::from_utf8(fields[i + 1].to_vec())?;
-        if !key.is_empty() {
-            options.insert(key, val);
+        // An empty key means the pairing has lost sync with the packet, so
+        // every later field would be read one position out and values would
+        // be taken for keys. Whatever follows cannot be trusted.
+        if key.is_empty() {
+            break;
         }
+        options.insert(key, val);
         i += 2;
     }
 
@@ -202,7 +214,10 @@ fn parse_ack(buf: &[u8]) -> Result<Packet> {
 
 /// Parse ERROR: 2‑byte opcode | 2‑byte code | msg\0
 fn parse_error(buf: &[u8]) -> Result<Packet> {
-    if buf.len() < 5 {
+    // The trailing NUL is required by the RFC, but implementations that send
+    // no message sometimes omit it. Refusing those four bytes would turn a
+    // client's abort into an opaque parse failure and hide its error code.
+    if buf.len() < 4 {
         return Err(anyhow!("ERROR packet too short"));
     }
     let code = u16::from_be_bytes([buf[2], buf[3]]);
@@ -330,6 +345,20 @@ impl NetasciiDecoder {
         }
 
         out
+    }
+
+    /// Emit anything still held back once no more blocks are coming.
+    ///
+    /// A `\r` at the very end of a transfer has no following byte to tell it
+    /// apart from `\r\n` or `\r\0`, so it waits here. Without this call it is
+    /// never written and the stored file is one byte short of the original.
+    pub fn finish(&mut self) -> Vec<u8> {
+        if self.pending_cr {
+            self.pending_cr = false;
+            vec![b'\r']
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -582,5 +611,53 @@ mod tests {
         assert!(enc.has_overflow());
         let out2 = enc.drain_overflow(512);
         assert_eq!(out2, b"d\r\n");
+    }
+
+    #[test]
+    fn a_trailing_cr_survives_the_end_of_a_transfer() {
+        let mut dec = NetasciiDecoder::new();
+        assert_eq!(dec.decode(b"line\r"), b"line");
+        assert_eq!(dec.finish(), b"\r");
+        // Draining twice must not invent a second byte.
+        assert!(dec.finish().is_empty());
+    }
+
+    #[test]
+    fn an_error_packet_without_a_message_still_parses() {
+        let pkt = Packet::from_bytes(&[0, 5, 0, 1]).expect("a bare ERROR is still an ERROR");
+        match pkt {
+            Packet::ERROR { code, msg } => {
+                assert_eq!(code, 1);
+                assert!(msg.is_empty());
+            }
+            other => panic!("expected ERROR, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unsupported_transfer_mode_is_rejected() {
+        let mut req = vec![0, 1];
+        req.extend_from_slice(b"f\0octe\0");
+        Packet::from_bytes(&req).expect_err("a truncated mode must not pass as octet");
+
+        let mut req = vec![0, 1];
+        req.extend_from_slice(b"f\0mail\0");
+        Packet::from_bytes(&req).expect("mail is one of the three RFC 1350 modes");
+    }
+
+    #[test]
+    fn option_parsing_stops_rather_than_pairing_values_as_keys() {
+        // A stray NUL after the mode shifts every following field by one.
+        let mut req = vec![0, 1];
+        req.extend_from_slice(b"f\0octet\0\0blksize\x001024\0");
+        match Packet::from_bytes(&req).expect("request parses") {
+            Packet::RRQ { options, .. } => {
+                assert!(
+                    !options.contains_key("1024"),
+                    "a value must never be taken for a key: {options:?}"
+                );
+            }
+            other => panic!("expected RRQ, got {other:?}"),
+        }
     }
 }

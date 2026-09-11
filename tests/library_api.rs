@@ -617,3 +617,73 @@ async fn a_client_replaying_one_ack_cannot_hold_a_download_open() {
     shutdown_tx.send(true).expect("shutdown signal");
     server.await.expect("server task").expect("server result");
 }
+
+#[tokio::test]
+async fn a_netascii_upload_ending_in_cr_keeps_that_byte() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+
+    let reservation = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("reserve test port");
+    let listener_address = reservation.local_addr().expect("listener address");
+    drop(reservation);
+
+    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server_dir = dir.path().to_path_buf();
+    let server = tokio::spawn(async move {
+        run(
+            listener_address,
+            server_dir,
+            events,
+            shutdown_rx,
+            ServerConfig::default(),
+        )
+        .await
+    });
+
+    wait_until_listening(&mut event_rx).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    let mut request = Vec::from(&2_u16.to_be_bytes()[..]);
+    request.extend_from_slice(b"cr.txt\0netascii\0");
+    client
+        .send_to(&request, listener_address)
+        .await
+        .expect("WRQ");
+
+    let mut buffer = [0_u8; 616];
+    let (_, from) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("ACK 0 timeout")
+        .expect("datagram");
+    assert_eq!(&buffer[..4], &[0, 4, 0, 0]);
+
+    // A short final block whose last byte is a lone CR: the decoder cannot
+    // resolve it until it knows nothing more is coming.
+    let mut data = vec![0, 3, 0, 1];
+    data.extend_from_slice(b"line\r");
+    client.send_to(&data, from).await.expect("DATA 1");
+
+    tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("final ACK timeout")
+        .expect("datagram");
+
+    let uploaded = dir.path().join("cr.txt");
+    let body = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(body) = tokio::fs::read(&uploaded).await {
+                return body;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the upload must be promoted");
+
+    assert_eq!(body, b"line\r", "the trailing CR must not be dropped");
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
