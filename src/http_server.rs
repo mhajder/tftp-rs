@@ -11,7 +11,7 @@ use axum::response::{Html, IntoResponse, Response};
 use tokio::sync::{mpsc, watch};
 use tokio_util::io::ReaderStream;
 
-use tftp_rs::server::{ServerEvent, sanitize_path, validate_bind_addr};
+use tftp_rs::server::{ServerEvent, sanitize_path};
 
 struct HttpState {
     dir: PathBuf,
@@ -24,7 +24,6 @@ pub async fn run(
     tx: mpsc::UnboundedSender<ServerEvent>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    validate_bind_addr(addr)?;
     let state = Arc::new(HttpState {
         dir,
         tx: tx.clone(),
