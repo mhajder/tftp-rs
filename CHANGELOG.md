@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.0](https://github.com/mhajder/tftp-rs/compare/v0.3.2...v0.4.0) (2026-09-11)
+
+
+### 🚀 Features
+
+* bind TFTP sockets to a named network interface ([#28](https://github.com/mhajder/tftp-rs/issues/28)) ([79c4588](https://github.com/mhajder/tftp-rs/commit/79c45884712762f76f74332d7047dfb69fc60e83))
+* expose an embeddable library API with optional dashboard dependencies ([#27](https://github.com/mhajder/tftp-rs/issues/27)) ([05c48b6](https://github.com/mhajder/tftp-rs/commit/05c48b6eb982b31cbb77a88e42de5f0e77be8388))
+
+
+### 🐛 Bug Fixes
+
+* let the HTTP file server bind a wildcard address ([#32](https://github.com/mhajder/tftp-rs/issues/32)) ([cdeb5a0](https://github.com/mhajder/tftp-rs/commit/cdeb5a00ac23a0639679a6fbefbc186136de9203))
+* report an unusable bind, and scope --interface to every socket ([#33](https://github.com/mhajder/tftp-rs/issues/33)) ([119116d](https://github.com/mhajder/tftp-rs/commit/119116d5feb044bb8f81b87dbacfe5272c692fb1))
+
 ## [0.3.2](https://github.com/mhajder/tftp-rs/compare/v0.3.1...v0.3.2) (2026-04-06)
 
 
