@@ -686,6 +686,9 @@ async fn run_inner(
                     Ok(p) => p,
                     Err(e) => {
                         let _ = tx.send(ServerEvent::Log(format!("{peer}: bad packet: {e}")));
+                        // Say so, rather than leaving the client to retransmit
+                        // an unparseable request until its own timeout.
+                        send_error(local_addr, interface.as_ref(), peer, 4, "Illegal TFTP operation").await;
                         continue;
                     }
                 };
@@ -777,6 +780,45 @@ async fn run_inner(
     Ok(())
 }
 
+/// A request that failed before the transfer started, carrying the TFTP error
+/// code the client should be told about.
+///
+/// Without this the client is told nothing at all: it retransmits its request
+/// until its own timeout, and the retransmission is swallowed by the
+/// duplicate-request guard.
+struct RequestFailure {
+    code: u16,
+    message: &'static str,
+    error: anyhow::Error,
+}
+
+impl RequestFailure {
+    fn new(code: u16, message: &'static str, error: anyhow::Error) -> Self {
+        Self {
+            code,
+            message,
+            error,
+        }
+    }
+
+    /// Error code 4, for a request the server will not act on at all.
+    fn illegal(error: anyhow::Error) -> Self {
+        Self::new(4, "Illegal TFTP operation", error)
+    }
+}
+
+/// Tell the client why its request failed, then hand the error back to the
+/// caller for logging.
+async fn report_failure(
+    local_addr: SocketAddr,
+    interface: Option<&InterfaceBinding>,
+    peer: SocketAddr,
+    failure: RequestFailure,
+) -> anyhow::Error {
+    send_error(local_addr, interface, peer, failure.code, failure.message).await;
+    failure.error
+}
+
 // ---------------------------------------------------------------------------
 // RRQ handler  (client downloads a file from us)
 // ---------------------------------------------------------------------------
@@ -798,18 +840,38 @@ async fn handle_rrq(
     } = ctx;
     let dir = dir.as_path();
     let config = config.as_ref();
-    let path = sanitize_path(dir, filename)?;
-    let metadata = tokio::fs::metadata(&path)
-        .await
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => {
-                anyhow!("file not found: {}", path.display())
-            }
-            std::io::ErrorKind::PermissionDenied => {
-                anyhow!("permission denied: {}", path.display())
-            }
-            _ => anyhow!("cannot read {}: {e}", path.display()),
-        })?;
+
+    let opened = async {
+        let path = sanitize_path(dir, filename).map_err(RequestFailure::illegal)?;
+        let metadata = tokio::fs::metadata(&path)
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => RequestFailure::new(
+                    1,
+                    "File not found",
+                    anyhow!("file not found: {}", path.display()),
+                ),
+                std::io::ErrorKind::PermissionDenied => RequestFailure::new(
+                    2,
+                    "Access violation",
+                    anyhow!("permission denied: {}", path.display()),
+                ),
+                _ => RequestFailure::new(
+                    2,
+                    "Access violation",
+                    anyhow!("cannot read {}: {e}", path.display()),
+                ),
+            })?;
+        Ok::<_, RequestFailure>((path, metadata))
+    }
+    .await;
+
+    let (path, metadata) = match opened {
+        Ok(opened) => opened,
+        Err(failure) => {
+            return Err(report_failure(local_addr, interface.as_ref(), peer, failure).await);
+        }
+    };
     let total_bytes = metadata.len();
 
     let is_netascii = mode == "netascii";
@@ -897,9 +959,17 @@ async fn handle_rrq(
     }
 
     // Stream the file.
-    let mut file = tokio::fs::File::open(&path)
-        .await
-        .map_err(|e| anyhow!("cannot open {}: {e}", path.display()))?;
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(e) => {
+            let failure = RequestFailure::new(
+                2,
+                "Access violation",
+                anyhow!("cannot open {}: {e}", path.display()),
+            );
+            return Err(report_failure(local_addr, interface.as_ref(), peer, failure).await);
+        }
+    };
     let mut block_buf = vec![0u8; blksize];
     let mut block_num: u16 = 1;
     let mut transferred: u64 = 0;
@@ -1129,7 +1199,13 @@ async fn handle_wrq(
     } = ctx;
     let dir = dir.as_path();
     let config = config.as_ref();
-    let path = sanitize_path(dir, filename)?;
+    let path = match sanitize_path(dir, filename) {
+        Ok(path) => path,
+        Err(e) => {
+            let failure = RequestFailure::illegal(e);
+            return Err(report_failure(local_addr, interface.as_ref(), peer, failure).await);
+        }
+    };
 
     // Overwrite protection.
     if !config.allow_overwrite && path.exists() {
