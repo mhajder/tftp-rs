@@ -1000,7 +1000,9 @@ async fn handle_rrq(
             if last_block {
                 break;
             }
-            block_num = block_num.wrapping_add(1);
+            // No increment here. The fill loop above already advanced
+            // block_num past every block it queued, so incrementing again
+            // would leave a gap between one window and the next.
         }
     } else {
         // --- Classic single-block transfer ---

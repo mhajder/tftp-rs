@@ -297,3 +297,114 @@ async fn probe_bind_rejects_a_missing_interface() {
         "unexpected error: {error}"
     );
 }
+
+#[tokio::test]
+async fn windowed_download_numbers_blocks_consecutively() {
+    const BLOCKS: usize = 5;
+    const WINDOW: u16 = 2;
+
+    let dir = tempfile::tempdir().expect("temporary directory");
+    // Four full blocks plus a short one, so the transfer spans several windows
+    // and still ends on a block the server marks as final.
+    let body: Vec<u8> = (0..(512 * (BLOCKS - 1) + 100))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    tokio::fs::write(dir.path().join("big.bin"), &body)
+        .await
+        .expect("test file");
+
+    let reservation = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("reserve test port");
+    let listener_address = reservation.local_addr().expect("listener address");
+    drop(reservation);
+
+    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server_dir = dir.path().to_path_buf();
+    let server = tokio::spawn(async move {
+        run(
+            listener_address,
+            server_dir,
+            events,
+            shutdown_rx,
+            ServerConfig {
+                max_window_size: WINDOW,
+                ..ServerConfig::default()
+            },
+        )
+        .await
+    });
+
+    wait_until_listening(&mut event_rx).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    client
+        .send_to(
+            &rrq_with_options("big.bin", &[("windowsize", &WINDOW.to_string())]),
+            listener_address,
+        )
+        .await
+        .expect("RRQ");
+
+    let mut buffer = vec![0_u8; 1024];
+    let mut transfer_address = None;
+    let mut seen_blocks = Vec::new();
+    let mut received = Vec::new();
+
+    loop {
+        let (length, from) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.recv_from(&mut buffer),
+        )
+        .await
+        .expect("server went quiet mid-transfer")
+        .expect("datagram");
+        let from = *transfer_address.get_or_insert(from);
+
+        match u16::from_be_bytes([buffer[0], buffer[1]]) {
+            // OACK: accept the negotiated options.
+            6 => {
+                client.send_to(&[0, 4, 0, 0], from).await.expect("ACK 0");
+            }
+            // DATA: record the block number, acknowledge the end of a window.
+            3 => {
+                let block = u16::from_be_bytes([buffer[2], buffer[3]]);
+                seen_blocks.push(block);
+                received.extend_from_slice(&buffer[4..length]);
+                let short = length - 4 < 512;
+                if short || seen_blocks.len() % WINDOW as usize == 0 {
+                    client
+                        .send_to(&[0, 4, buffer[2], buffer[3]], from)
+                        .await
+                        .expect("ACK");
+                }
+                if short {
+                    break;
+                }
+            }
+            opcode => panic!("unexpected opcode {opcode}"),
+        }
+    }
+
+    let expected: Vec<u16> = (1..=BLOCKS as u16).collect();
+    assert_eq!(
+        seen_blocks, expected,
+        "windowed transfers must number blocks consecutively"
+    );
+    assert_eq!(received, body, "the file must arrive intact");
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
+
+fn rrq_with_options(filename: &str, options: &[(&str, &str)]) -> Vec<u8> {
+    let mut request = rrq(filename);
+    for (key, value) in options {
+        request.extend_from_slice(key.as_bytes());
+        request.push(0);
+        request.extend_from_slice(value.as_bytes());
+        request.push(0);
+    }
+    request
+}
