@@ -408,3 +408,49 @@ fn rrq_with_options(filename: &str, options: &[(&str, &str)]) -> Vec<u8> {
     }
     request
 }
+
+#[tokio::test]
+async fn a_request_for_a_missing_file_is_answered_with_an_error() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+
+    let reservation = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("reserve test port");
+    let listener_address = reservation.local_addr().expect("listener address");
+    drop(reservation);
+
+    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server_dir = dir.path().to_path_buf();
+    let server = tokio::spawn(async move {
+        run(
+            listener_address,
+            server_dir,
+            events,
+            shutdown_rx,
+            ServerConfig::default(),
+        )
+        .await
+    });
+
+    wait_until_listening(&mut event_rx).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    client
+        .send_to(&rrq("absent.txt"), listener_address)
+        .await
+        .expect("RRQ");
+
+    let mut buffer = [0_u8; 512];
+    let (length, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("the client must not be left waiting for its own timeout")
+        .expect("datagram");
+
+    // ERROR, code 1 (file not found), then a NUL-terminated message.
+    assert_eq!(&buffer[..4], &[0, 5, 0, 1]);
+    assert_eq!(buffer[length - 1], 0);
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
