@@ -176,7 +176,7 @@ fn get_interface_ips(interface: Option<&str>) -> Vec<String> {
         .unwrap_or_default()
         .into_iter()
         .filter(|iface| match interface {
-            Some(name) => iface.name == name,
+            Some(name) => interface_matches(&iface.name, name),
             None => !iface.is_loopback(),
         })
         .filter(|iface| iface.addr.ip().is_ipv4())
@@ -185,6 +185,16 @@ fn get_interface_ips(interface: Option<&str>) -> Vec<String> {
     ips.sort();
     ips.dedup();
     ips
+}
+
+/// Whether an address reported under `label` belongs to the device `wanted`.
+///
+/// Linux reports ifconfig-style secondary addresses under an alias label
+/// such as `eth0:1`, while `SO_BINDTODEVICE("eth0")` serves them all. An
+/// exact comparison would hide those addresses from the header, or empty it
+/// entirely when every address on the device is aliased.
+fn interface_matches(label: &str, wanted: &str) -> bool {
+    label == wanted || label.split_once(':').is_some_and(|(dev, _)| dev == wanted)
 }
 
 // ---------------------------------------------------------------------------
@@ -696,5 +706,23 @@ fn human_bytes(b: u64) -> String {
         format!("{:.1} KB", b as f64 / KB as f64)
     } else {
         format!("{b} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interface_match_accepts_the_device_and_its_aliases() {
+        assert!(interface_matches("eth0", "eth0"));
+        assert!(interface_matches("eth0:1", "eth0"));
+    }
+
+    #[test]
+    fn interface_match_rejects_a_different_device() {
+        assert!(!interface_matches("eth1", "eth0"));
+        assert!(!interface_matches("eth10", "eth1"));
+        assert!(!interface_matches("veth0:1", "eth0"));
     }
 }
