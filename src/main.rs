@@ -72,8 +72,15 @@ struct Cli {
     /// uploads for existing files are rejected with an error.
     ///
     /// Takes an explicit value, because the default is already true and a
-    /// bare flag could therefore never turn overwriting off.
-    #[arg(long, action = ArgAction::Set, default_value_t = true)]
+    /// bare flag could therefore never turn overwriting off. The bare form
+    /// still parses, and still means true.
+    #[arg(
+        long,
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = true
+    )]
     allow_overwrite: bool,
 
     /// Maximum number of retransmission attempts before giving up.
@@ -96,13 +103,28 @@ async fn main() -> Result<()> {
 
     // Fail before the dashboard takes over the terminal. A server error after
     // that point only reaches the user as a log line in the TUI.
-    server::validate_bind(tftp_addr, cli.interface.as_deref())
-        .with_context(|| format!("cannot bind TFTP server to {tftp_addr}"))?;
-    if let Some(http_port) = cli.http_port {
-        let http_addr = SocketAddr::new(cli.bind, http_port);
-        server::bind_tcp_listener(http_addr, cli.interface.as_deref())
-            .with_context(|| format!("cannot bind HTTP server to {http_addr}"))?;
+    //
+    // The interface is resolved on its own first, so an unknown one is not
+    // reported under a "cannot bind" headline that sends the reader looking
+    // for a port conflict.
+    if let Some(interface) = cli.interface.as_deref() {
+        server::validate_interface(interface)?;
     }
+    server::probe_bind(tftp_addr, cli.interface.as_deref())
+        .with_context(|| format!("cannot bind TFTP server to {tftp_addr}"))?;
+
+    // The HTTP listener is bound here and handed to the task, rather than
+    // probed and rebound later, so nothing can take the port in between.
+    let http_listener = match cli.http_port {
+        Some(http_port) => {
+            let http_addr = SocketAddr::new(cli.bind, http_port);
+            Some(
+                server::bind_tcp_listener(http_addr, cli.interface.as_deref())
+                    .with_context(|| format!("cannot bind HTTP server to {http_addr}"))?,
+            )
+        }
+        None => None,
+    };
 
     let dir = std::fs::canonicalize(&cli.dir)?;
 
@@ -161,15 +183,14 @@ async fn main() -> Result<()> {
         })
     };
 
-    // Optionally spawn the HTTP file server.
-    if let Some(http_port) = cli.http_port {
+    // Optionally spawn the HTTP file server on the listener bound above.
+    if let Some(http_listener) = http_listener {
         let dir = dir.clone();
         let tx = ev_tx.clone();
-        let http_addr = SocketAddr::new(cli.bind, http_port);
         let interface = cli.interface.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                http_server::run(http_addr, interface, dir, tx.clone(), http_shutdown_rx).await
+                http_server::run(http_listener, interface, dir, tx.clone(), http_shutdown_rx).await
             {
                 let _ = tx.send(ServerEvent::Log(format!("HTTP server fatal: {e}")));
             }

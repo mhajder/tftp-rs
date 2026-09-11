@@ -3,7 +3,7 @@ use std::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use tftp_rs::server::run_on_interface;
-use tftp_rs::server::{ServerConfig, ServerEvent, run, validate_bind_addr};
+use tftp_rs::server::{ServerConfig, ServerEvent, probe_bind, run, validate_bind_addr};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 
@@ -260,4 +260,40 @@ fn rrq(filename: &str) -> Vec<u8> {
     request.extend_from_slice(b"octet");
     request.push(0);
     request
+}
+
+#[tokio::test]
+async fn probe_bind_reports_an_address_already_in_use() {
+    let holder = UdpSocket::bind("127.0.0.1:0").await.expect("held socket");
+    let taken = holder.local_addr().expect("held address");
+
+    let error = probe_bind(taken, None).expect_err("a held address must be rejected");
+    assert!(
+        error.to_string().contains("in use"),
+        "unexpected error: {error}"
+    );
+
+    drop(holder);
+    probe_bind(taken, None).expect("the address is free once released");
+}
+
+#[tokio::test]
+async fn probe_bind_accepts_a_wildcard_the_host_can_bind() {
+    // Unlike validate_bind_addr, probing asks the OS rather than refusing
+    // wildcards on principle.
+    probe_bind(SocketAddr::from(([0, 0, 0, 0], 0)), None).expect("wildcard bind");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn probe_bind_rejects_a_missing_interface() {
+    let error = probe_bind(
+        SocketAddr::from(([127, 0, 0, 1], 0)),
+        Some("tftp-rs-no-such-if"),
+    )
+    .expect_err("an unknown interface must be rejected");
+    assert!(
+        error.to_string().contains("was not found"),
+        "unexpected error: {error}"
+    );
 }

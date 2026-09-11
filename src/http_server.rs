@@ -11,15 +11,20 @@ use axum::response::{Html, IntoResponse, Response};
 use tokio::sync::{mpsc, watch};
 use tokio_util::io::ReaderStream;
 
-use tftp_rs::server::{ServerEvent, bind_tcp_listener, sanitize_path};
+use tftp_rs::server::{ServerEvent, sanitize_path};
 
 struct HttpState {
     dir: PathBuf,
     tx: mpsc::UnboundedSender<ServerEvent>,
 }
 
+/// Serve `dir` over HTTP on an already-bound listener.
+///
+/// The caller binds, so a port conflict is reported before the dashboard
+/// takes the terminal rather than as a log line behind it. `interface` is
+/// only used for the log message; scoping already happened at bind time.
 pub async fn run(
-    addr: SocketAddr,
+    listener: std::net::TcpListener,
     interface: Option<String>,
     dir: PathBuf,
     tx: mpsc::UnboundedSender<ServerEvent>,
@@ -35,11 +40,8 @@ pub async fn run(
         .with_state(state)
         .into_make_service_with_connect_info::<SocketAddr>();
 
-    // Scope the listener to the same interface as the TFTP sockets, so
-    // --interface does not leave the served directory reachable on every
-    // interface over HTTP.
-    let listener =
-        tokio::net::TcpListener::from_std(bind_tcp_listener(addr, interface.as_deref())?)?;
+    let addr = listener.local_addr()?;
+    let listener = tokio::net::TcpListener::from_std(listener)?;
     tx.send(ServerEvent::Log(match interface.as_deref() {
         Some(interface) => format!("HTTP server listening on {addr} via interface {interface}"),
         None => format!("HTTP server listening on {addr}"),

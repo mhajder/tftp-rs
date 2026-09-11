@@ -577,15 +577,18 @@ pub fn validate_interface(name: &str) -> Result<()> {
 /// Check that the server could take `bind_addr`, optionally on `interface`.
 ///
 /// Opens and immediately closes the same socket [`run`] and
-/// [`run_on_interface`] would, so a caller can report an unusable address or
-/// interface up front instead of discovering it once the server is already
-/// running in the background. Binding the real listener is a separate step,
-/// so the address can still be taken in between.
+/// [`run_on_interface`] would, so a caller can report an unusable address up
+/// front instead of discovering it once the server is already running in the
+/// background. Binding the real listener is a separate step, so the address
+/// can still be taken in between.
 ///
 /// The interface is applied to the probe as well. Two servers on different
 /// interfaces may legitimately share one address and port, and a probe
 /// without the interface would wrongly reject the second one.
-pub fn validate_bind(bind_addr: SocketAddr, interface: Option<&str>) -> Result<()> {
+///
+/// This is not [`validate_bind_addr`], which refuses wildcard addresses. A
+/// wildcard address the host can bind passes here.
+pub fn probe_bind(bind_addr: SocketAddr, interface: Option<&str>) -> Result<()> {
     let interface = interface.map(InterfaceBinding::from_name).transpose()?;
     bind_raw_udp_socket(bind_addr, interface.as_ref(), None).map(|_| ())
 }
