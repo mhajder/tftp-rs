@@ -33,7 +33,7 @@ tsize, windowsize), netascii mode, and an optional HTTP file server.
 - **Configurable retransmission** -- `--timeout` (ms) and `--max-retries` to tune behaviour for unstable networks
 - **HTTP file server** -- optional HTTP server for browser-based directory browsing and file downloads (`--http-port`)
 - **TUI dashboard** -- real-time view of server status, shared files tree, active transfers with progress bars, and timestamped scrollable logs
-- **Interface discovery** -- displays all non-loopback network interface IPs in the header (auto-refreshes every 10 seconds)
+- **Interface discovery** -- with the default wildcard bind, displays all non-loopback network interface IPs in the header (auto-refreshes every 10 seconds); with an explicit `--bind` it shows the one address in use
 - **Scrollable panels** -- Tab to cycle focus between Shared Files, Active Transfers, and Logs panels; Up/Down to scroll
 - **Log file export** -- optionally write all logs to a file with `--log-file`
 - **Path sanitization** -- prevents directory traversal attacks
@@ -88,7 +88,8 @@ tftp-rs -d /srv/tftp --max-block-size 1468
 # Reject uploads for existing files
 tftp-rs -d /srv/tftp --allow-overwrite false
 
-# Keep the service on one network interface (Linux/macOS)
+# Keep the service on one network interface (Linux/macOS). The HTTP file
+# server, when enabled, is scoped to the same interface.
 tftp-rs --bind 192.0.2.1 --interface eth0 -d /srv/tftp
 
 # All options combined
@@ -100,7 +101,7 @@ tftp-rs -p 69 -d /srv/tftp -l /var/log/tftp.log --http-port 8080 -w 4 -t 200
 ```
 Options:
       --bind <BIND>                    Local IP address to bind [default: 0.0.0.0]
-      --interface <INTERFACE>          Bind every TFTP socket to this network interface (Linux/macOS)
+      --interface <INTERFACE>          Bind every socket to this network interface (Linux/macOS)
   -p, --port <PORT>                  UDP port to listen on [default: 69]
   -d, --dir <DIR>                    Directory to serve / receive files [default: .]
   -l, --log-file <LOG_FILE>          Optional file path to write logs to

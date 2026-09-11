@@ -7,7 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -95,6 +95,8 @@ async fn main() -> Result<()> {
     if let Some(interface) = cli.interface.as_deref() {
         server::validate_interface(interface)?;
     }
+    std::net::UdpSocket::bind(tftp_addr)
+        .with_context(|| format!("cannot bind TFTP server to {tftp_addr}"))?;
 
     let dir = std::fs::canonicalize(&cli.dir)?;
 
@@ -158,8 +160,11 @@ async fn main() -> Result<()> {
         let dir = dir.clone();
         let tx = ev_tx.clone();
         let http_addr = SocketAddr::new(cli.bind, http_port);
+        let interface = cli.interface.clone();
         tokio::spawn(async move {
-            if let Err(e) = http_server::run(http_addr, dir, tx.clone(), http_shutdown_rx).await {
+            if let Err(e) =
+                http_server::run(http_addr, interface, dir, tx.clone(), http_shutdown_rx).await
+            {
                 let _ = tx.send(ServerEvent::Log(format!("HTTP server fatal: {e}")));
             }
         });
@@ -171,11 +176,18 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(cli.port, cli.http_port, dir, log_writer);
+    let mut app = App::new(
+        cli.bind,
+        cli.interface.clone(),
+        cli.port,
+        cli.http_port,
+        dir,
+        log_writer,
+    );
     app.online = true;
     app.push_log("Starting tftp-rs...".into());
 
-    let result = run_tui(&mut terminal, &mut app, &mut ev_rx).await;
+    let result = run_tui(&mut terminal, &mut app, &mut ev_rx, &server_handle).await;
 
     // Log shutdown before cleanup.
     app.push_log("Shutting down...".into());
@@ -196,6 +208,7 @@ async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     ev_rx: &mut mpsc::UnboundedReceiver<ServerEvent>,
+    server_handle: &tokio::task::JoinHandle<()>,
 ) -> Result<()> {
     loop {
         // Draw.
@@ -204,6 +217,11 @@ async fn run_tui(
         // Poll for server events (drain all pending).
         while let Ok(ev) = ev_rx.try_recv() {
             handle_server_event(app, ev);
+        }
+
+        // The status badge must not claim ONLINE once the server task is gone.
+        if server_handle.is_finished() {
+            app.online = false;
         }
 
         // Periodically refresh interface IPs.

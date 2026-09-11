@@ -111,7 +111,7 @@ impl InterfaceBinding {
                 .bind_device(Some(self.name.as_bytes()))
                 .with_context(|| {
                     format!(
-                        "cannot bind UDP socket to network interface '{}' (SO_BINDTODEVICE)",
+                        "cannot bind socket to network interface '{}' (SO_BINDTODEVICE)",
                         self.name
                     )
                 })
@@ -126,7 +126,7 @@ impl InterfaceBinding {
             };
             result.with_context(|| {
                 format!(
-                    "cannot bind UDP socket to network interface '{}' (IP_BOUND_IF/IPV6_BOUND_IF)",
+                    "cannot bind socket to network interface '{}' (IP_BOUND_IF/IPV6_BOUND_IF)",
                     self.name
                 )
             })
@@ -137,7 +137,7 @@ impl InterfaceBinding {
             let _ = socket;
             let _ = local_addr;
             Err(anyhow!(
-                "interface-bound UDP sockets are currently supported only on macOS and Linux"
+                "interface-bound sockets are currently supported only on macOS and Linux"
             ))
         }
     }
@@ -158,7 +158,7 @@ fn resolve_interface_index(name: &str) -> Result<NonZeroU32> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn resolve_interface_index(_name: &str) -> Result<NonZeroU32> {
     Err(anyhow!(
-        "interface-bound UDP sockets are currently supported only on macOS and Linux"
+        "interface-bound sockets are currently supported only on macOS and Linux"
     ))
 }
 
@@ -300,6 +300,40 @@ fn bind_udp_socket(
     Ok(UdpSocket::from_std(std_sock)?)
 }
 
+/// Create a listening TCP socket on one local address, optionally constrained
+/// to one named network interface.
+///
+/// TFTP itself never needs this. It exists so a host application that scopes
+/// its TFTP service to an interface can scope its companion TCP services the
+/// same way, instead of leaving them reachable on every interface. The
+/// returned listener is non-blocking and ready for
+/// `tokio::net::TcpListener::from_std`.
+///
+/// Interface binding is Linux and macOS only; elsewhere a non-`None`
+/// `interface` returns an error rather than silently binding everywhere.
+pub fn bind_tcp_listener(
+    addr: SocketAddr,
+    interface: Option<&str>,
+) -> Result<std::net::TcpListener> {
+    let domain = if addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let raw = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    raw.set_reuse_address(true)?;
+
+    if let Some(name) = interface {
+        InterfaceBinding::from_name(name)?.apply_to(&raw, addr)?;
+    }
+
+    raw.bind(&addr.into())?;
+    raw.listen(1024)?;
+    raw.set_nonblocking(true)?;
+
+    Ok(raw.into())
+}
+
 /// Create an ephemeral UDP socket with send/receive buffers sized for the
 /// negotiated block size.  The OS default buffer (~9 KB on macOS) is too
 /// small for blksize values above ~8 KB and causes "No buffer space
@@ -341,17 +375,9 @@ pub fn validate_bind_addr(addr: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-fn with_port(addr: SocketAddr, port: u16) -> SocketAddr {
-    match addr {
-        SocketAddr::V4(mut address) => {
-            address.set_port(port);
-            SocketAddr::V4(address)
-        }
-        SocketAddr::V6(mut address) => {
-            address.set_port(port);
-            SocketAddr::V6(address)
-        }
-    }
+fn with_port(mut addr: SocketAddr, port: u16) -> SocketAddr {
+    addr.set_port(port);
+    addr
 }
 
 async fn send_error(
@@ -1456,6 +1482,7 @@ pub fn sanitize_path(dir: &Path, filename: &str) -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn interface_binding_rejects_embedded_nul() {
         let error = InterfaceBinding::from_name("en0\0other")

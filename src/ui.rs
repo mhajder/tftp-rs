@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
@@ -24,6 +25,8 @@ pub enum FocusedPanel {
 
 /// Top-level application state shared between the event loop and the renderer.
 pub struct App {
+    pub bind: IpAddr,
+    pub interface: Option<String>,
     pub port: u16,
     pub http_port: Option<u16>,
     pub dir: PathBuf,
@@ -44,13 +47,23 @@ pub struct App {
 
 impl App {
     pub fn new(
+        bind: IpAddr,
+        interface: Option<String>,
         port: u16,
         http_port: Option<u16>,
         dir: PathBuf,
         log_writer: Option<BufWriter<File>>,
     ) -> Self {
-        let interface_ips = get_interface_ips();
+        // Only a wildcard bind is reachable on every address, so that is the
+        // only case where enumerating the host's addresses tells the truth.
+        let interface_ips = if bind.is_unspecified() {
+            get_interface_ips()
+        } else {
+            Vec::new()
+        };
         Self {
+            bind,
+            interface,
             port,
             http_port,
             dir,
@@ -70,7 +83,7 @@ impl App {
     }
 
     pub fn refresh_interfaces_if_needed(&mut self) {
-        if self.last_ip_refresh.elapsed() >= IP_REFRESH_INTERVAL {
+        if self.bind.is_unspecified() && self.last_ip_refresh.elapsed() >= IP_REFRESH_INTERVAL {
             self.interface_ips = get_interface_ips();
             self.last_ip_refresh = Instant::now();
         }
@@ -311,22 +324,46 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
     };
 
-    let interfaces_str = if app.interface_ips.is_empty() {
-        "none".to_string()
+    // A wildcard bind really is reachable on every address, so list them. An
+    // explicit --bind is reachable on exactly one, and listing the rest would
+    // advertise addresses the server never answers on.
+    let (bind_label, bind_value) = if app.bind.is_unspecified() {
+        let ips = if app.interface_ips.is_empty() {
+            "none".to_string()
+        } else {
+            app.interface_ips.join(", ")
+        };
+        ("Interfaces: ", ips)
     } else {
-        app.interface_ips.join(", ")
+        ("Bind: ", app.bind.to_string())
     };
 
     let mut spans = vec![
         Span::styled(" Status: ", Style::default().fg(Color::DarkGray)),
         Span::styled(status, status_style),
         Span::raw("  |  "),
-        Span::styled("Interfaces: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(interfaces_str, Style::default().fg(Color::Cyan)),
-        Span::raw("  |  "),
-        Span::styled("Port: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{}", app.port), Style::default().fg(Color::Cyan)),
+        Span::styled(bind_label, Style::default().fg(Color::DarkGray)),
+        Span::styled(bind_value, Style::default().fg(Color::Cyan)),
     ];
+
+    if let Some(ref interface) = app.interface {
+        spans.push(Span::raw("  |  "));
+        spans.push(Span::styled(
+            "Interface: ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            interface.clone(),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+
+    spans.push(Span::raw("  |  "));
+    spans.push(Span::styled("Port: ", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        format!("{}", app.port),
+        Style::default().fg(Color::Cyan),
+    ));
 
     if let Some(hp) = app.http_port {
         spans.push(Span::raw("  |  "));

@@ -11,7 +11,7 @@ use axum::response::{Html, IntoResponse, Response};
 use tokio::sync::{mpsc, watch};
 use tokio_util::io::ReaderStream;
 
-use tftp_rs::server::{ServerEvent, sanitize_path};
+use tftp_rs::server::{ServerEvent, bind_tcp_listener, sanitize_path};
 
 struct HttpState {
     dir: PathBuf,
@@ -20,6 +20,7 @@ struct HttpState {
 
 pub async fn run(
     addr: SocketAddr,
+    interface: Option<String>,
     dir: PathBuf,
     tx: mpsc::UnboundedSender<ServerEvent>,
     mut shutdown: watch::Receiver<bool>,
@@ -34,8 +35,15 @@ pub async fn run(
         .with_state(state)
         .into_make_service_with_connect_info::<SocketAddr>();
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tx.send(ServerEvent::Log(format!("HTTP server listening on {addr}")))?;
+    // Scope the listener to the same interface as the TFTP sockets, so
+    // --interface does not leave the served directory reachable on every
+    // interface over HTTP.
+    let listener =
+        tokio::net::TcpListener::from_std(bind_tcp_listener(addr, interface.as_deref())?)?;
+    tx.send(ServerEvent::Log(match interface.as_deref() {
+        Some(interface) => format!("HTTP server listening on {addr} via interface {interface}"),
+        None => format!("HTTP server listening on {addr}"),
+    }))?;
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
