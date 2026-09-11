@@ -1637,6 +1637,15 @@ async fn handle_wrq(
         }
     }
 
+    // A netascii transfer can end on a CR the decoder is still holding back.
+    if let Some(ref mut dec) = decoder {
+        let tail = dec.finish();
+        if !tail.is_empty() {
+            file.write_all(&tail).await?;
+            transferred += tail.len() as u64;
+        }
+    }
+
     file.flush().await?;
     drop(file);
 
