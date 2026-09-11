@@ -31,15 +31,15 @@ path = "src/main.rs"
 required-features = ["tui"]
 
 [dependencies]
-anyhow = "1.0.102"
-axum = { version = "0.8.8", optional = true }
-clap = { version = "4.6.0", features = ["derive"], optional = true }
+anyhow = "1.0.104"
+axum = { version = "0.8.9", optional = true }
+clap = { version = "4.6.6", features = ["derive"], optional = true }
 crossterm = { version = "0.29", optional = true }
 if-addrs = { version = "0.15", optional = true }
 ratatui = { version = "0.30", optional = true }
-socket2 = { version = "0.6.3", features = ["all"] }
-tokio = { version = "1.50.0", features = ["fs", "io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
-tokio-util = { version = "0.7.18", features = ["io"], optional = true }
+socket2 = { version = "0.6.5", features = ["all"] }
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7.19", features = ["io"], optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "0.2"
