@@ -556,3 +556,64 @@ fn wrq_with_options(filename: &str, options: &[(&str, &str)]) -> Vec<u8> {
     }
     request
 }
+
+#[tokio::test]
+async fn a_client_replaying_one_ack_cannot_hold_a_download_open() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    tokio::fs::write(dir.path().join("big.bin"), vec![7_u8; 4096])
+        .await
+        .expect("test file");
+
+    let reservation = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("reserve test port");
+    let listener_address = reservation.local_addr().expect("listener address");
+    drop(reservation);
+
+    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server_dir = dir.path().to_path_buf();
+    let server = tokio::spawn(async move {
+        run(
+            listener_address,
+            server_dir,
+            events,
+            shutdown_rx,
+            ServerConfig {
+                max_retries: 3,
+                ..ServerConfig::default()
+            },
+        )
+        .await
+    });
+
+    wait_until_listening(&mut event_rx).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    client
+        .send_to(&rrq("big.bin"), listener_address)
+        .await
+        .expect("RRQ");
+
+    // Answer every DATA block with ACK 0, which acknowledges nothing. Without
+    // a bound this never ends: one full block sent per 4-byte ACK.
+    let mut buffer = vec![0_u8; 1024];
+    let mut blocks_sent = 0;
+    loop {
+        let received =
+            tokio::time::timeout(Duration::from_millis(1500), client.recv_from(&mut buffer)).await;
+        let Ok(Ok((_, from))) = received else {
+            // The server went quiet, which is the point: it gave up.
+            break;
+        };
+        blocks_sent += 1;
+        assert!(
+            blocks_sent <= 8,
+            "the server is still resending after {blocks_sent} blocks; max_retries is 3"
+        );
+        client.send_to(&[0, 4, 0, 0], from).await.expect("ACK 0");
+    }
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
