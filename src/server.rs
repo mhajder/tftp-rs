@@ -949,7 +949,15 @@ async fn handle_rrq(
             send_resilient(&sock, &oack_bytes).await?;
             match timeout(timeout_dur, sock.recv(&mut recv_buf)).await {
                 Ok(Ok(n)) => {
-                    let ack = Packet::from_bytes(&recv_buf[..n])?;
+                    // A datagram the parser rejects is not a reason to abandon
+                    // a transfer; it is a stray packet like any other.
+                    let Ok(ack) = Packet::from_bytes(&recv_buf[..n]) else {
+                        retries += 1;
+                        if retries > max_retries {
+                            return Err(anyhow!("timeout waiting for OACK acknowledgment"));
+                        }
+                        continue;
+                    };
                     match ack {
                         Packet::ACK { block_num: 0 } => break,
                         Packet::ERROR { code, msg } => {
@@ -1036,7 +1044,15 @@ async fn handle_rrq(
                 // Wait for ACK for any block in the window.
                 match timeout(timeout_dur, sock.recv(&mut recv_buf)).await {
                     Ok(Ok(n)) => {
-                        let ack = Packet::from_bytes(&recv_buf[..n])?;
+                        let Ok(ack) = Packet::from_bytes(&recv_buf[..n]) else {
+                            retries += 1;
+                            if retries > max_retries {
+                                return Err(anyhow!(
+                                    "no usable acknowledgment after {max_retries} attempts"
+                                ));
+                            }
+                            continue;
+                        };
                         match ack {
                             Packet::ACK { block_num: bn } => {
                                 // Check if this ACK is for the end of our window.
@@ -1123,7 +1139,15 @@ async fn handle_rrq(
                 send_resilient(&sock, &pkt_bytes).await?;
                 match timeout(timeout_dur, sock.recv(&mut recv_buf)).await {
                     Ok(Ok(n)) => {
-                        let ack = Packet::from_bytes(&recv_buf[..n])?;
+                        let Ok(ack) = Packet::from_bytes(&recv_buf[..n]) else {
+                            retries += 1;
+                            if retries > max_retries {
+                                return Err(anyhow!(
+                                    "no acknowledgment for block {block_num} after {max_retries} attempts"
+                                ));
+                            }
+                            continue;
+                        };
                         match ack {
                             Packet::ACK { block_num: bn } if bn == block_num => break,
                             Packet::ERROR { code, msg } => {
@@ -1189,7 +1213,7 @@ async fn read_next_block(
                 return Ok(data);
             }
             // Not enough overflow to fill a block — read more from file.
-            let bytes_read = file.read(buf).await?;
+            let bytes_read = fill_buffer(file, buf).await?;
             if bytes_read == 0 {
                 return Ok(data);
             }
@@ -1200,16 +1224,34 @@ async fn read_next_block(
             return Ok(combined);
         }
 
-        let bytes_read = file.read(buf).await?;
+        let bytes_read = fill_buffer(file, buf).await?;
         if bytes_read == 0 {
             return Ok(Vec::new());
         }
         let raw = &buf[..bytes_read];
         Ok(enc.encode(raw, blksize))
     } else {
-        let bytes_read = file.read(buf).await?;
+        let bytes_read = fill_buffer(file, buf).await?;
         Ok(buf[..bytes_read].to_vec())
     }
+}
+
+/// Read until `buf` is full or the source is exhausted.
+///
+/// A short block is how TFTP signals the end of a transfer, so a single
+/// `read` is not enough: a pipe, a character device, or a file being written
+/// concurrently can return fewer bytes than asked for with more still to
+/// come, and the transfer would be truncated and reported complete.
+async fn fill_buffer(file: &mut tokio::fs::File, buf: &mut [u8]) -> Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let read = file.read(&mut buf[filled..]).await?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    Ok(filled)
 }
 
 /// Check if an encoder has pending overflow data.
@@ -1373,6 +1415,8 @@ async fn handle_wrq(
 
     let mut transferred: u64 = 0;
     let mut expected_block: u16 = 1;
+    // The block the final ACK covered, which is what a dallying reply repeats.
+    let last_block_num: u16;
     let mut decoder = if is_netascii {
         Some(NetasciiDecoder::new())
     } else {
@@ -1390,7 +1434,15 @@ async fn handle_wrq(
             loop {
                 match timeout(timeout_dur, sock.recv(&mut recv_buf)).await {
                     Ok(Ok(n)) => {
-                        let pkt = Packet::from_bytes(&recv_buf[..n])?;
+                        let Ok(pkt) = Packet::from_bytes(&recv_buf[..n]) else {
+                            retries += 1;
+                            if retries > max_retries {
+                                return Err(anyhow!(
+                                    "no usable data after {max_retries} unreadable packets"
+                                ));
+                            }
+                            continue;
+                        };
                         match pkt {
                             Packet::DATA { block_num, data } if block_num == expected_block => {
                                 let is_last = data.len() < blksize;
@@ -1482,6 +1534,7 @@ async fn handle_wrq(
             })?;
 
             if last_block {
+                last_block_num = expected_block.wrapping_sub(1);
                 break;
             }
         }
@@ -1494,7 +1547,15 @@ async fn handle_wrq(
             loop {
                 match timeout(timeout_dur, sock.recv(&mut recv_buf)).await {
                     Ok(Ok(n)) => {
-                        let pkt = Packet::from_bytes(&recv_buf[..n])?;
+                        let Ok(pkt) = Packet::from_bytes(&recv_buf[..n]) else {
+                            retries += 1;
+                            if retries > max_retries {
+                                return Err(anyhow!(
+                                    "no usable data after {max_retries} unreadable packets"
+                                ));
+                            }
+                            continue;
+                        };
                         match pkt {
                             Packet::DATA { block_num, data } if block_num == expected_block => {
                                 data_payload = data;
@@ -1569,6 +1630,7 @@ async fn handle_wrq(
             })?;
 
             if is_last {
+                last_block_num = expected_block;
                 break;
             }
             expected_block = expected_block.wrapping_add(1);
@@ -1622,6 +1684,23 @@ async fn handle_wrq(
     tx.send(ServerEvent::Log(format!(
         "{peer}: WRQ \"{filename}\" complete ({transferred} bytes)"
     )))?;
+
+    // RFC 1350 dallying, after the file is already in place: if the final ACK
+    // was lost the client resends its last block and would otherwise report a
+    // failure for an upload that arrived intact.
+    let final_ack = Packet::ACK {
+        block_num: last_block_num,
+    }
+    .to_bytes();
+    if let Ok(Ok(n)) = timeout(timeout_dur, sock.recv(&mut recv_buf)).await
+        && matches!(
+            Packet::from_bytes(&recv_buf[..n]),
+            Ok(Packet::DATA { block_num, .. }) if block_num == last_block_num
+        )
+    {
+        let _ = send_resilient(&sock, &final_ack).await;
+    }
+
     Ok(())
 }
 
