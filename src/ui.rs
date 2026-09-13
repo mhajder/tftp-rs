@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::net::IpAddr;
@@ -11,6 +12,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph};
 
 use tftp_rs::server::{TransferInfo, TransferKind};
+
+/// How many log lines the dashboard keeps in memory.
+const MAX_LOG_LINES: usize = 2_000;
+
+/// How often the shared-files tree is rebuilt.
+const TREE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How often to refresh the interface IP list.
 const IP_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
@@ -31,7 +38,7 @@ pub struct App {
     pub http_port: Option<u16>,
     pub dir: PathBuf,
     pub online: bool,
-    pub logs: Vec<String>,
+    pub logs: VecDeque<String>,
     pub transfers: Vec<TransferInfo>,
     pub log_scroll: u16,
     pub files_scroll: u16,
@@ -41,6 +48,8 @@ pub struct App {
     /// true = "Yes" selected, false = "No" selected.
     pub quit_selection: bool,
     pub interface_ips: Vec<String>,
+    file_tree: Vec<TreeEntry>,
+    last_tree_refresh: Instant,
     last_ip_refresh: Instant,
     log_writer: Option<BufWriter<File>>,
 }
@@ -62,6 +71,7 @@ impl App {
         } else {
             Vec::new()
         };
+        let dir_for_tree = dir.clone();
         Self {
             bind,
             interface,
@@ -69,7 +79,7 @@ impl App {
             http_port,
             dir,
             online: false,
-            logs: Vec::new(),
+            logs: VecDeque::new(),
             transfers: Vec::new(),
             log_scroll: 0,
             files_scroll: 0,
@@ -78,8 +88,23 @@ impl App {
             show_quit_dialog: false,
             quit_selection: false,
             interface_ips,
+            file_tree: build_tree(&dir_for_tree, 0, &[]),
+            // Far enough back that the first frame redraws with fresh data.
+            last_tree_refresh: Instant::now() - TREE_REFRESH_INTERVAL,
             last_ip_refresh: Instant::now(),
             log_writer,
+        }
+    }
+
+    /// Rebuild the shared-files tree if it has gone stale.
+    ///
+    /// The walk reads every directory under the served root and stats every
+    /// entry. Doing that per frame means ten full traversals a second, of a
+    /// tree anyone with write access can grow.
+    fn refresh_tree_if_needed(&mut self) {
+        if self.last_tree_refresh.elapsed() >= TREE_REFRESH_INTERVAL {
+            self.file_tree = build_tree(&self.dir, 0, &[]);
+            self.last_tree_refresh = Instant::now();
         }
     }
 
@@ -99,10 +124,19 @@ impl App {
             let _ = w.flush();
         }
 
-        self.logs.push(line);
-        // Auto-scroll to bottom.
-        let visible = 10u16; // approximate
-        let total = self.logs.len() as u16;
+        self.logs.push_back(line);
+        // One line per request, and a served directory is reachable by anyone
+        // who can open a socket, so the buffer has to have an end. The file
+        // written by --log-file keeps the full history.
+        while self.logs.len() > MAX_LOG_LINES {
+            self.logs.pop_front();
+        }
+
+        // Auto-scroll to bottom. The count is clamped rather than cast: at
+        // 65536 lines a u16 wraps and the pane jumps back to the oldest entry
+        // and stops following.
+        let visible = 10;
+        let total = u16::try_from(self.logs.len()).unwrap_or(u16::MAX);
         self.log_scroll = total.saturating_sub(visible);
     }
 
@@ -129,7 +163,9 @@ impl App {
                 self.transfers_scroll = self.transfers_scroll.saturating_add(1);
             }
             FocusedPanel::Logs => {
-                let max = (self.logs.len() as u16).saturating_sub(1);
+                let max = u16::try_from(self.logs.len())
+                    .unwrap_or(u16::MAX)
+                    .saturating_sub(1);
                 if self.log_scroll < max {
                     self.log_scroll += 1;
                 }
@@ -211,8 +247,25 @@ struct TreeEntry {
     ancestors_are_last: Vec<bool>,
 }
 
+/// How deep the shared-files tree is walked.
+///
+/// TFTP uploads create the directories in their path, so the depth of the
+/// served tree is chosen by whoever can write to it, and this walk recurses
+/// on the thread that draws the interface.
+const MAX_TREE_DEPTH: usize = 16;
+
+/// How many entries the tree will collect before it stops.
+///
+/// Only a screenful is ever shown, and the alternative is walking an
+/// arbitrarily large directory on every frame.
+const MAX_TREE_ENTRIES: usize = 5_000;
+
 fn build_tree(dir: &Path, depth: usize, ancestors_are_last: &[bool]) -> Vec<TreeEntry> {
     let mut entries = Vec::new();
+
+    if depth >= MAX_TREE_DEPTH {
+        return entries;
+    }
 
     let mut children: Vec<_> = match std::fs::read_dir(dir) {
         Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
@@ -233,6 +286,9 @@ fn build_tree(dir: &Path, depth: usize, ancestors_are_last: &[bool]) -> Vec<Tree
 
     let count = children.len();
     for (i, entry) in children.into_iter().enumerate() {
+        if entries.len() >= MAX_TREE_ENTRIES {
+            break;
+        }
         let is_last = i + 1 == count;
         let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
         let name = entry.file_name().to_string_lossy().to_string();
@@ -426,7 +482,8 @@ fn draw_middle(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_shared_files(f: &mut Frame, app: &mut App, area: Rect) {
-    let tree = build_tree(&app.dir, 0, &[]);
+    app.refresh_tree_if_needed();
+    let tree = &app.file_tree;
     let items: Vec<ListItem> = if tree.is_empty() {
         vec![ListItem::new(" (empty directory)")]
     } else {
@@ -609,7 +666,9 @@ fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
         .title(title)
         .border_style(border_style);
     let inner_height = area.height.saturating_sub(2) as usize;
-    let max_scroll = (app.logs.len() as u16).saturating_sub(inner_height as u16);
+    let max_scroll = u16::try_from(app.logs.len())
+        .unwrap_or(u16::MAX)
+        .saturating_sub(inner_height as u16);
     app.log_scroll = app.log_scroll.min(max_scroll);
 
     let start = app.log_scroll as usize;
