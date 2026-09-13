@@ -19,7 +19,7 @@ tsize, windowsize), netascii mode, and an optional HTTP file server.
 
 - **RFC 1350 compliant** -- hand-rolled TFTP protocol, no external TFTP crates
 - **RFC 2347/2348 option negotiation** -- blksize up to 65,464 bytes; capped via `--max-block-size` for VPN environments
-- **RFC 2349 timeout + tsize** -- clients can negotiate a custom reply timeout; tsize reports file size on downloads and is echoed on uploads
+- **RFC 2349 timeout + tsize** -- clients can negotiate a custom reply timeout; tsize reports file size on octet downloads and is echoed on uploads (a netascii download sends more bytes than the file holds, so tsize is left unacknowledged there)
 - **RFC 7440 windowsize** -- windowed transfers send multiple DATA blocks before waiting for ACK, significantly improving throughput on high-latency links
 - **Netascii mode** -- full bidirectional conversion (`\n` ↔ `\r\n`, `\r` ↔ `\r\0`) across block boundaries for legacy clients
 - **Unlimited transfer size** -- block numbers roll over correctly (u16 wrap-around), enabling files larger than 32 MB with the default 512-byte block size

@@ -456,6 +456,90 @@ async fn a_request_for_a_missing_file_is_answered_with_an_error() {
 }
 
 #[tokio::test]
+async fn a_netascii_download_does_not_acknowledge_tsize() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    // Six bytes on disk, nine on the wire: each LF is sent as CR LF.
+    tokio::fs::write(dir.path().join("lines.txt"), b"a\nb\nc\n")
+        .await
+        .expect("test file");
+
+    let reservation = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("reserve test port");
+    let listener_address = reservation.local_addr().expect("listener address");
+    drop(reservation);
+
+    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server_dir = dir.path().to_path_buf();
+    let server = tokio::spawn(async move {
+        run(
+            listener_address,
+            server_dir,
+            events,
+            shutdown_rx,
+            ServerConfig::default(),
+        )
+        .await
+    });
+
+    wait_until_listening(&mut event_rx).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    let mut request = Vec::from(&1_u16.to_be_bytes()[..]);
+    for field in [
+        &b"lines.txt"[..],
+        b"netascii",
+        b"blksize",
+        b"512",
+        b"tsize",
+        b"0",
+    ] {
+        request.extend_from_slice(field);
+        request.push(0);
+    }
+    client
+        .send_to(&request, listener_address)
+        .await
+        .expect("RRQ");
+
+    let mut buffer = [0_u8; 616];
+    let (length, transfer) =
+        tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+            .await
+            .expect("OACK timeout")
+            .expect("datagram");
+
+    assert_eq!(&buffer[..2], &[0, 6], "expected an OACK");
+    let fields: Vec<&[u8]> = buffer[2..length].split(|&b| b == 0).collect();
+    assert!(
+        fields.iter().any(|f| *f == b"blksize"),
+        "blksize is still negotiated"
+    );
+    assert!(
+        !fields.iter().any(|f| *f == b"tsize"),
+        "tsize cannot be answered for a netascii transfer: {:?}",
+        String::from_utf8_lossy(&buffer[2..length])
+    );
+
+    client.send_to(&[0, 4, 0, 0], transfer).await.expect("ACK 0");
+
+    let (length, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("DATA timeout")
+        .expect("datagram");
+    assert_eq!(&buffer[..4], &[0, 3, 0, 1]);
+    assert_eq!(
+        &buffer[4..length],
+        b"a\r\nb\r\nc\r\n",
+        "the transfer is nine bytes, which is why the six-byte file size was the wrong answer"
+    );
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
+
+#[tokio::test]
 async fn a_request_for_a_directory_is_answered_with_an_error() {
     let dir = tempfile::tempdir().expect("temporary directory");
     std::fs::create_dir(dir.path().join("subdir")).expect("a directory to request");

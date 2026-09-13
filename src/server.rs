@@ -966,8 +966,22 @@ async fn handle_rrq(
     let mut oack_options = negotiated.oack;
 
     // Fill in tsize if the client requested it.
+    //
+    // RFC 2349 defines tsize as the size of the transfer, which in netascii is
+    // not the size of the file: every LF and every CR becomes two bytes on the
+    // wire. Answering with the file size tells the client to expect fewer bytes
+    // than will arrive, and a client that sizes a buffer or a flash partition
+    // from it, or checks the total when the transfer ends, is misled. The true
+    // figure cannot be had without encoding the whole file first, which would
+    // mean reading every byte twice for an option that is only advisory, so the
+    // option is left unacknowledged instead. RFC 2347 has the client carry on
+    // without it.
     if oack_options.contains_key("tsize") {
-        oack_options.insert("tsize".to_string(), total_bytes.to_string());
+        if is_netascii {
+            oack_options.remove("tsize");
+        } else {
+            oack_options.insert("tsize".to_string(), total_bytes.to_string());
+        }
     }
 
     let mut detail_parts = Vec::new();
