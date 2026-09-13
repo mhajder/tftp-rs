@@ -158,9 +158,15 @@ fn parse_request(buf: &[u8], is_rrq: bool) -> Result<Packet> {
     // rather than quietly served as octet: a client that asked for netascii
     // and had its mode field truncated would otherwise receive unconverted
     // bytes with nothing to indicate it.
-    if !matches!(mode.as_str(), "netascii" | "octet" | "mail") {
-        return Err(anyhow!("unsupported transfer mode '{mode}'"));
-    }
+    //
+    // "binary" is not in the RFC but predates it as a synonym for octet and is
+    // still emitted by some bootloaders, so it is accepted and normalised
+    // rather than turned into a hard failure for those clients.
+    let mode = match mode.as_str() {
+        "binary" => "octet".to_string(),
+        "netascii" | "octet" | "mail" => mode,
+        _ => return Err(anyhow!("unsupported transfer mode '{mode}'")),
+    };
 
     // Parse RFC 2347 options (key-value pairs after mode).
     let mut options = HashMap::new();
@@ -643,6 +649,16 @@ mod tests {
         let mut req = vec![0, 1];
         req.extend_from_slice(b"f\0mail\0");
         Packet::from_bytes(&req).expect("mail is one of the three RFC 1350 modes");
+    }
+
+    #[test]
+    fn binary_is_accepted_as_a_synonym_for_octet() {
+        let mut req = vec![0, 1];
+        req.extend_from_slice(b"f\0BINARY\0");
+        match Packet::from_bytes(&req).expect("older clients still send binary") {
+            Packet::RRQ { mode, .. } => assert_eq!(mode, "octet"),
+            other => panic!("expected RRQ, got {other:?}"),
+        }
     }
 
     #[test]
