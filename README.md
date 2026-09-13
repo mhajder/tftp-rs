@@ -33,7 +33,7 @@ tsize, windowsize), netascii mode, and an optional HTTP file server.
 - **Configurable retransmission** -- `--timeout` (ms) and `--max-retries` to tune behaviour for unstable networks
 - **HTTP file server** -- optional HTTP server for browser-based directory browsing and file downloads (`--http-port`)
 - **TUI dashboard** -- real-time view of server status, shared files tree, active transfers with progress bars, and timestamped scrollable logs
-- **Interface discovery** -- with the default wildcard bind, displays all non-loopback network interface IPs in the header (auto-refreshes every 10 seconds); with an explicit `--bind` it shows the one address in use
+- **Interface discovery** -- with the default wildcard bind, displays the host's non-loopback IPv4 addresses in the header (auto-refreshes every 10 seconds); adding `--interface` narrows that to the named device's IPv4 addresses, loopback included, because those are the ones the server answers on; with an explicit `--bind` it shows the one address in use
 - **Scrollable panels** -- Tab to cycle focus between Shared Files, Active Transfers, and Logs panels; Up/Down to scroll
 - **Log file export** -- optionally write all logs to a file with `--log-file`
 - **Path sanitization** -- prevents directory traversal attacks
@@ -144,6 +144,11 @@ run(bind, "/srv/tftp".into(), events, shutdown_rx, ServerConfig::default()).awai
 # }
 ```
 
+`events` carries progress and log messages for a caller that wants to show
+them. It is not part of the transfer path: drop the receiver and the events
+stop, while the server goes on serving files and still shuts down cleanly. A
+caller that wants none of them can drop it straight away.
+
 For a service that must remain on one macOS or Linux interface, use
 `run_on_interface`. It applies the OS interface binding to the listener,
 temporary error replies, and every ephemeral TFTP transfer socket; it fails
@@ -184,15 +189,18 @@ dashboard and HTTP dependencies with `tftp-rs = { default-features = false,
 
 ### TUI Controls
 
-| Key              | Action                                  |
-|------------------|-----------------------------------------|
-| `q` / `Esc`      | Open quit confirmation dialog          |
-| `Tab`            | Cycle focus between panels              |
-| `Up` / `Down`    | Scroll the focused panel               |
-| `Left` / `Right` | Toggle Yes/No in quit dialog           |
-| `Enter`          | Confirm selection in quit dialog        |
-| `y`              | Confirm quit                            |
-| `n`              | Cancel quit                             |
+| Key                      | Action                           |
+|--------------------------|----------------------------------|
+| `q` / `Esc`              | Open quit confirmation dialog    |
+| `Tab`                    | Cycle focus between panels       |
+| `Up` / `Down`            | Scroll the focused panel         |
+| `Left` / `Right` / `Tab` | Toggle Yes/No in quit dialog     |
+| `Enter`                  | Confirm selection in quit dialog |
+| `y`                      | Confirm quit                     |
+| `n` / `Esc`              | Cancel quit                      |
+
+While the quit dialog is open it takes every key, so `Tab` toggles the
+selection there rather than cycling panels.
 
 ### Testing with a TFTP client
 
@@ -229,6 +237,9 @@ src/
 tests/
   integration.rs       End-to-end RRQ/WRQ integration tests including
                        blksize/tsize negotiation and block-number rollover
+  library_api.rs       Library-facing tests: bind address and interface
+                       handling, option negotiation, retransmission budgets,
+                       and the error replies a client is owed
 ```
 
 ### Protocol Implementation
@@ -252,7 +263,7 @@ When a client includes options in its RRQ/WRQ request, the server responds with 
 |--------|-----|-------------|
 | `blksize` | 2348 | Block payload size, 8–65,464 bytes (default 512). Capped by `--max-block-size` and OS UDP limit. |
 | `timeout` | 2349 | Per-transfer reply timeout in seconds (1–255). Overrides the server default for that transfer. |
-| `tsize` | 2349 | On RRQ: server reports actual file size. On WRQ: server echoes back the client's value. |
+| `tsize` | 2349 | On octet RRQ: server reports the file size. On netascii RRQ: left unacknowledged, since the encoded transfer is longer than the file on disk. On WRQ: server echoes back the client's value. |
 | `windowsize` | 7440 | Number of DATA blocks sent before waiting for an ACK. Capped by `--max-window-size`. |
 
 ### Windowed Transfer (RFC 7440)
@@ -273,8 +284,10 @@ Block numbers are 16-bit unsigned integers. The server uses `wrapping_add(1)` on
 
 - **Rust** 2024 edition
 - **tokio** -- async UDP and TCP I/O
+- **socket2** -- interface-bound sockets and per-transfer buffer sizing
+- **libc** -- interface name lookup on Linux and macOS
 - **ratatui** + **crossterm** -- terminal UI
-- **axum** -- HTTP file server
+- **axum** + **tokio-util** -- HTTP file server and streamed file bodies
 - **clap** -- CLI argument parsing
 - **anyhow** -- error handling
 - **if-addrs** -- network interface discovery
