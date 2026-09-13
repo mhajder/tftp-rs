@@ -580,7 +580,10 @@ async fn a_netascii_download_does_not_acknowledge_tsize() {
         String::from_utf8_lossy(&buffer[2..length])
     );
 
-    client.send_to(&[0, 4, 0, 0], transfer).await.expect("ACK 0");
+    client
+        .send_to(&[0, 4, 0, 0], transfer)
+        .await
+        .expect("ACK 0");
 
     let (length, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
         .await
@@ -855,7 +858,10 @@ async fn a_client_replaying_one_ack_cannot_hold_a_windowed_download_open() {
         .expect("OACK timeout")
         .expect("OACK");
     assert_eq!(&buffer[..2], &[0, 6], "expected an OACK");
-    client.send_to(&[0, 4, 0, 0], transfer).await.expect("ACK 0");
+    client
+        .send_to(&[0, 4, 0, 0], transfer)
+        .await
+        .expect("ACK 0");
 
     // ACK 0 is the block before the first window, so every reply looks like a
     // request to resend it. Nothing is ever acknowledged, so the server has to
