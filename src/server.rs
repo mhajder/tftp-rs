@@ -931,6 +931,19 @@ async fn handle_rrq(
                     anyhow!("cannot read {}: {e}", path.display()),
                 ),
             })?;
+        // A directory has metadata like any other entry, and opening one
+        // succeeds. The first read is what fails, by which point the request
+        // has been accepted and there is no longer anywhere to report it: the
+        // client is left retransmitting into silence until its own timeout.
+        // The same goes for a device node or a socket. Only a regular file can
+        // be streamed as blocks.
+        if !metadata.is_file() {
+            return Err(RequestFailure::new(
+                1,
+                "File not found",
+                anyhow!("not a regular file: {}", path.display()),
+            ));
+        }
         Ok::<_, RequestFailure>((path, metadata))
     }
     .await;
