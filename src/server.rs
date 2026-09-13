@@ -1383,15 +1383,22 @@ async fn handle_wrq(
         send_resilient(&sock, &ack0.to_bytes()).await?;
     }
 
-    // What to retransmit while waiting for the client. Until block 1 arrives,
-    // an OACK must be repeated as an OACK: replying ACK 0 instead would tell
-    // the client its options were refused, leaving it on 512-byte blocks while
-    // the server still expects the negotiated blksize. The server would then
-    // treat block 1 as the final short block and rename a truncated upload as
-    // a complete one.
-    let reacknowledge = |expected_block: u16| -> Vec<u8> {
-        match (&oack, expected_block) {
-            (Some(oack_bytes), 1) => oack_bytes.clone(),
+    // What to retransmit while waiting for the client. Until the first block
+    // arrives, an OACK must be repeated as an OACK: replying ACK 0 instead
+    // would tell the client its options were refused, leaving it on 512-byte
+    // blocks while the server still expects the negotiated blksize. The server
+    // would then treat block 1 as the final short block and rename a truncated
+    // upload as a complete one.
+    //
+    // The test is whether anything has arrived, not whether the awaited block
+    // is number 1. Block numbers are u16 and wrap, so block 1 comes round
+    // again every 65536 blocks -- 32 MiB at the default block size -- and
+    // repeating the OACK there would restart a client that is halfway through
+    // a file, corrupting it.
+    let mut received_any = false;
+    let reacknowledge = |expected_block: u16, received_any: bool| -> Vec<u8> {
+        match &oack {
+            Some(oack_bytes) if !received_any => oack_bytes.clone(),
             _ => Packet::ACK {
                 block_num: expected_block.wrapping_sub(1),
             }
@@ -1447,6 +1454,10 @@ async fn handle_wrq(
                             Packet::DATA { block_num, data } if block_num == expected_block => {
                                 let is_last = data.len() < blksize;
                                 window_data.push((block_num, data));
+                                received_any = true;
+                                // Forward progress: the peer earns a fresh
+                                // budget for the rest of this window.
+                                retries = 0;
                                 expected_block = expected_block.wrapping_add(1);
                                 if is_last {
                                     last_block = true;
@@ -1498,7 +1509,7 @@ async fn handle_wrq(
                                 expected_block
                             ));
                         }
-                        send_resilient(&sock, &reacknowledge(expected_block)).await?;
+                        send_resilient(&sock, &reacknowledge(expected_block, received_any)).await?;
                     }
                 }
             }
@@ -1559,6 +1570,7 @@ async fn handle_wrq(
                         match pkt {
                             Packet::DATA { block_num, data } if block_num == expected_block => {
                                 data_payload = data;
+                                received_any = true;
                                 break;
                             }
                             // Duplicate of previous block – re-ACK it, and
@@ -1594,7 +1606,7 @@ async fn handle_wrq(
                         if retries > max_retries {
                             return Err(anyhow!("timeout waiting for DATA block {expected_block}"));
                         }
-                        send_resilient(&sock, &reacknowledge(expected_block)).await?;
+                        send_resilient(&sock, &reacknowledge(expected_block, received_any)).await?;
                     }
                 }
             }

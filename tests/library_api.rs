@@ -687,3 +687,74 @@ async fn a_netascii_upload_ending_in_cr_keeps_that_byte() {
     shutdown_tx.send(true).expect("shutdown signal");
     server.await.expect("server task").expect("server result");
 }
+
+#[tokio::test]
+async fn a_mid_transfer_timeout_never_repeats_the_oack() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+
+    let reservation = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("reserve test port");
+    let listener_address = reservation.local_addr().expect("listener address");
+    drop(reservation);
+
+    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server_dir = dir.path().to_path_buf();
+    let server = tokio::spawn(async move {
+        run(
+            listener_address,
+            server_dir,
+            events,
+            shutdown_rx,
+            ServerConfig::default(),
+        )
+        .await
+    });
+
+    wait_until_listening(&mut event_rx).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    client
+        .send_to(
+            &wrq_with_options("wrap.bin", &[("blksize", "8")]),
+            listener_address,
+        )
+        .await
+        .expect("WRQ");
+
+    let mut buffer = [0_u8; 256];
+    let (_, from) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("OACK timeout")
+        .expect("datagram");
+    assert_eq!(u16::from_be_bytes([buffer[0], buffer[1]]), 6, "OACK first");
+
+    // One full block, so the transfer is under way, then go quiet. The server
+    // must now repeat its ACK rather than the OACK, whatever the block number.
+    client
+        .send_to(
+            &[0, 3, 0, 1, b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h'],
+            from,
+        )
+        .await
+        .expect("DATA 1");
+    let _ = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("ACK 1 timeout")
+        .expect("datagram");
+    assert_eq!(&buffer[..4], &[0, 4, 0, 1]);
+
+    let (_, _) = tokio::time::timeout(Duration::from_secs(3), client.recv_from(&mut buffer))
+        .await
+        .expect("the server must retry")
+        .expect("datagram");
+    assert_eq!(
+        u16::from_be_bytes([buffer[0], buffer[1]]),
+        4,
+        "once data has arrived a retransmission is an ACK, never the OACK"
+    );
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    let _ = server.await;
+}
