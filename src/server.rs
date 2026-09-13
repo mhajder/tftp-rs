@@ -780,6 +780,20 @@ async fn run_inner(
     Ok(())
 }
 
+/// Longest the server will wait after a completed upload for the client to
+/// tell it the final acknowledgment went missing.
+const MAX_DALLY: Duration = Duration::from_secs(1);
+
+/// Whether a retransmitted block means the client missed the closing ACK.
+///
+/// A classic transfer can only resend the last block. A windowed one resends
+/// from its first unacknowledged block, so any block in the final window says
+/// the same thing.
+fn is_in_closing_window(block_num: u16, last_block_num: u16, windowsize: u16) -> bool {
+    let span = windowsize.max(1);
+    (0..span).any(|back| block_num == last_block_num.wrapping_sub(back))
+}
+
 /// Where an upload is staged before it is promoted to its final name.
 ///
 /// The transfer id is part of the name so that two clients uploading the same
@@ -990,12 +1004,16 @@ async fn handle_rrq(
     let mut file = match tokio::fs::File::open(&path).await {
         Ok(file) => file,
         Err(e) => {
-            let failure = RequestFailure::new(
-                2,
-                "Access violation",
-                anyhow!("cannot open {}: {e}", path.display()),
-            );
-            return Err(report_failure(local_addr, interface.as_ref(), peer, failure).await);
+            // The client has already exchanged packets with this socket, so
+            // the error has to come from it. RFC 1350 has the client discard
+            // anything from an unknown transfer id, and a reply from a fresh
+            // socket would be ignored and leave it waiting.
+            let error = Packet::ERROR {
+                code: 2,
+                msg: "Access violation".into(),
+            };
+            let _ = send_resilient(&sock, &error.to_bytes()).await;
+            return Err(anyhow!("cannot open {}: {e}", path.display()));
         }
     };
     let mut block_buf = vec![0u8; blksize];
@@ -1681,22 +1699,34 @@ async fn handle_wrq(
                 let _ = tokio::fs::remove_file(&part_path).await;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                send_error(
-                    local_addr,
-                    interface.as_ref(),
-                    peer,
-                    6,
-                    "File already exists",
-                )
-                .await;
+                let error = Packet::ERROR {
+                    code: 6,
+                    msg: "File already exists".into(),
+                };
+                let _ = send_resilient(&sock, &error.to_bytes()).await;
                 return Err(anyhow!("file already exists: {}", path.display()));
             }
-            Err(e) => {
-                return Err(anyhow!(
-                    "failed to link {} -> {}: {e}",
-                    part_path.display(),
-                    path.display()
-                ));
+            Err(_) => {
+                // FAT, exFAT, many SMB mounts and some container volume
+                // drivers have no hard links. Refusing to promote there would
+                // discard a file the client has already been told arrived, so
+                // fall back to a rename and accept that the existence check is
+                // no longer atomic.
+                if path.exists() {
+                    let error = Packet::ERROR {
+                        code: 6,
+                        msg: "File already exists".into(),
+                    };
+                    let _ = send_resilient(&sock, &error.to_bytes()).await;
+                    return Err(anyhow!("file already exists: {}", path.display()));
+                }
+                tokio::fs::rename(&part_path, &path).await.map_err(|e| {
+                    anyhow!(
+                        "failed to rename {} -> {}: {e}",
+                        part_path.display(),
+                        path.display()
+                    )
+                })?;
             }
         }
     }
@@ -1707,16 +1737,28 @@ async fn handle_wrq(
     )))?;
 
     // RFC 1350 dallying, after the file is already in place: if the final ACK
-    // was lost the client resends its last block and would otherwise report a
-    // failure for an upload that arrived intact.
+    // was lost the client resends and would otherwise report a failure for an
+    // upload that arrived intact.
+    //
+    // The wait is capped rather than using the negotiated timeout, which the
+    // client chooses and may set as high as 255 seconds. Until this returns
+    // the task, its socket, and this peer's entry in the in-progress set are
+    // all still held, so a client could otherwise pin resources for minutes
+    // per upload, and its own next request would be turned away as a
+    // duplicate.
+    let dally_for = timeout_dur.min(MAX_DALLY);
     let final_ack = Packet::ACK {
         block_num: last_block_num,
     }
     .to_bytes();
-    if let Ok(Ok(n)) = timeout(timeout_dur, sock.recv(&mut recv_buf)).await
+    if let Ok(Ok(n)) = timeout(dally_for, sock.recv(&mut recv_buf)).await
         && matches!(
             Packet::from_bytes(&recv_buf[..n]),
-            Ok(Packet::DATA { block_num, .. }) if block_num == last_block_num
+            // A windowed client retransmits from its first unacknowledged
+            // block, so anything in the closing window means the same thing:
+            // it never saw the last ACK.
+            Ok(Packet::DATA { block_num, .. })
+                if is_in_closing_window(block_num, last_block_num, windowsize)
         )
     {
         let _ = send_resilient(&sock, &final_ack).await;
