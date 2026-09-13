@@ -64,53 +64,48 @@ async fn serve_path(
     let uri_path = percent_decode(request.uri().path());
     let stripped = uri_path.trim_start_matches('/');
 
-    let _ = state
-        .tx
-        .send(ServerEvent::Log(format!("{addr}: HTTP GET /{stripped}")));
+    let method = request.method().clone();
+    let _ = state.tx.send(ServerEvent::Log(format!(
+        "{addr}: HTTP {method} /{stripped}"
+    )));
 
     // Root directory listing.
     if stripped.is_empty() {
-        return match render_directory(&state.dir, "/") {
-            Ok(html) => Html(html).into_response(),
-            Err(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to read directory",
-            )
-                .into_response(),
-        };
+        return listing_response(state.dir.clone(), "/".to_string()).await;
     }
 
-    // Try to resolve the path using the same sanitization as TFTP.
-    let resolved = match sanitize_path(&state.dir, stripped) {
-        Ok(p) => p,
-        Err(_) => {
-            return (StatusCode::NOT_FOUND, "Not found").into_response();
-        }
+    // Try to resolve the path using the same sanitization as TFTP. Path
+    // resolution touches the filesystem, so it goes to the blocking pool
+    // rather than stalling a worker shared with the TFTP server.
+    let dir = state.dir.clone();
+    let name = stripped.to_string();
+    let Ok(Ok(resolved)) = tokio::task::spawn_blocking(move || sanitize_path(&dir, &name)).await
+    else {
+        return (StatusCode::NOT_FOUND, "Not found").into_response();
     };
 
-    if resolved.is_dir() {
-        match render_directory(&resolved, &uri_path) {
-            Ok(html) => Html(html).into_response(),
-            Err(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to read directory",
-            )
-                .into_response(),
-        }
-    } else if resolved.is_file() {
+    let Ok(metadata) = tokio::fs::metadata(&resolved).await else {
+        return (StatusCode::NOT_FOUND, "Not found").into_response();
+    };
+
+    if metadata.is_dir() {
+        listing_response(resolved, uri_path.clone()).await
+    } else if metadata.is_file() {
         let ct = content_type_for(&resolved);
         let filename = resolved
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-
-        // Get file size for Content-Length header.
-        let file_size = match tokio::fs::metadata(&resolved).await {
-            Ok(m) => m.len(),
-            Err(_) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read file").into_response();
-            }
+        // The served directory is writable over TFTP, so an uploaded .html or
+        // .svg rendered inline would run as script on this origin. Anything
+        // active is handed over as a download instead.
+        let disposition = if is_active_content(ct) {
+            "attachment".to_string()
+        } else {
+            format!("inline; filename=\"{}\"", sanitize_filename(&filename))
         };
+
+        let file_size = metadata.len();
 
         // Stream the file instead of loading it all into memory.
         let file = match tokio::fs::File::open(&resolved).await {
@@ -126,16 +121,29 @@ async fn serve_path(
             [
                 ("content-type", ct.to_string()),
                 ("content-length", file_size.to_string()),
-                (
-                    "content-disposition",
-                    format!("inline; filename=\"{filename}\""),
-                ),
+                ("content-disposition", disposition),
+                ("x-content-type-options", "nosniff".to_string()),
             ],
             body,
         )
             .into_response()
     } else {
         (StatusCode::NOT_FOUND, "Not found").into_response()
+    }
+}
+
+/// Build a directory listing without holding an async worker.
+///
+/// `render_directory` walks the directory and stats every entry, which is
+/// blocking work on a runtime shared with the TFTP server.
+async fn listing_response(dir: PathBuf, display_path: String) -> Response {
+    match tokio::task::spawn_blocking(move || render_directory(&dir, &display_path)).await {
+        Ok(Ok(html)) => Html(html).into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to read directory",
+        )
+            .into_response(),
     }
 }
 
@@ -185,7 +193,11 @@ fn render_directory(dir: &Path, display_path: &str) -> std::io::Result<String> {
             .map(|(p, _)| if p.is_empty() { "/" } else { p })
             .unwrap_or("/");
         html.push_str("<tr><td><a href=\"");
-        html.push_str(parent);
+        // Escaped like every other interpolation here. A directory name is
+        // attacker-controlled -- TFTP uploads create directories -- so a name
+        // carrying a quote would otherwise close this attribute and let the
+        // rest of it become markup.
+        html.push_str(&html_escape(&url_encode(parent)));
         html.push_str("\">..</a></td><td></td></tr>");
     }
 
@@ -217,7 +229,7 @@ fn render_directory(dir: &Path, display_path: &str) -> std::io::Result<String> {
         };
 
         html.push_str("<tr><td><a href=\"");
-        html.push_str(&html_escape(&href));
+        html.push_str(&html_escape(&url_encode(&href)));
         html.push_str("\">");
         html.push_str(&html_escape(&display_name));
         html.push_str("</a></td><td class=\"size\">");
@@ -227,6 +239,24 @@ fn render_directory(dir: &Path, display_path: &str) -> std::io::Result<String> {
 
     html.push_str("</table></body></html>");
     Ok(html)
+}
+
+/// Whether a browser would execute this type on the serving origin.
+fn is_active_content(content_type: &str) -> bool {
+    matches!(
+        content_type,
+        "text/html" | "image/svg+xml" | "application/javascript" | "application/xml"
+    )
+}
+
+/// Strip what a header value cannot carry.
+///
+/// A quote would let an uploader end the filename parameter and add its own,
+/// and a control character makes the whole response unbuildable.
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_control() && *c != '"' && *c != '\\')
+        .collect()
 }
 
 fn content_type_for(path: &Path) -> &'static str {
@@ -258,6 +288,22 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Percent-encode a path for use in an href.
+///
+/// Without this a file called `a#b` or `a?b` links to a fragment or a query
+/// rather than to itself, and `%` in a name is read back as an escape.
+fn url_encode(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.as_bytes() {
+        match byte {
+            b'/' | b'-' | b'_' | b'.' | b'~' => out.push(*byte as char),
+            b if b.is_ascii_alphanumeric() => out.push(*b as char),
+            b => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 fn percent_decode(s: &str) -> String {
     let mut result = Vec::new();
     let bytes = s.as_bytes();
@@ -265,6 +311,10 @@ fn percent_decode(s: &str) -> String {
     while i < bytes.len() {
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
+            // from_str_radix accepts a leading sign, so "%+5" would decode to
+            // byte 5 instead of staying the three literal characters it is.
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
             && let Ok(val) = u8::from_str_radix(&String::from_utf8_lossy(&bytes[i + 1..i + 3]), 16)
         {
             result.push(val);
