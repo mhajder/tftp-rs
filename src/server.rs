@@ -1094,6 +1094,10 @@ async fn handle_rrq(
 
             // Send all blocks in the window.
             let mut retries = 0u32;
+            // Resends asked for by the client rather than by a timeout. Kept
+            // apart from `retries` so that a lossy link still gets the full
+            // budget for both, but bounded all the same.
+            let mut recoveries = 0u32;
             loop {
                 for (bn, payload) in &window {
                     let mut pkt_bytes = Vec::with_capacity(4 + payload.len());
@@ -1135,19 +1139,33 @@ async fn handle_rrq(
                                         }
                                     }
                                     transferred += acked_bytes;
-                                    // Continue loop to resend remaining blocks.
+                                    // The window shrank, so the client did
+                                    // move forward and both budgets start over.
                                     retries = 0;
+                                    recoveries = 0;
                                     continue;
                                 }
                                 // Re-acknowledging the block before this
                                 // window is how an RFC 7440 client reports
                                 // that the window's first block went missing.
-                                // That is ordinary recovery, so it does not
-                                // spend the retry budget; resending the window
-                                // is the correct answer.
+                                // Resending the window is the correct answer,
+                                // so it draws on its own budget rather than the
+                                // one a stray packet spends. It still has to be
+                                // bounded: nothing in the window has been
+                                // acknowledged, so a client repeating that one
+                                // number would otherwise have every block sent
+                                // back to it for ever, a whole window of
+                                // traffic for each four-byte packet.
                                 let previous_window_end =
                                     window.first().map(|(bn, _)| bn.wrapping_sub(1));
-                                if Some(bn) != previous_window_end {
+                                if Some(bn) == previous_window_end {
+                                    recoveries += 1;
+                                    if recoveries > max_retries {
+                                        return Err(anyhow!(
+                                            "window ending at block {window_end} was re-requested {max_retries} times without progress"
+                                        ));
+                                    }
+                                } else {
                                     // Any other block is outside the
                                     // conversation entirely.
                                     retries += 1;
