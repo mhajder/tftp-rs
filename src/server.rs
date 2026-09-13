@@ -673,6 +673,7 @@ async fn run_inner(
     let config = Arc::new(config);
     let mut buf = vec![0u8; MAX_PACKET];
     let mut next_id: u64 = 1;
+    let mut malformed_replies = ReplyBudget::new();
 
     // Track in-progress transfers to reject duplicate requests from the same peer.
     let reqs_in_progress: Arc<tokio::sync::Mutex<HashSet<SocketAddr>>> =
@@ -687,8 +688,14 @@ async fn run_inner(
                     Err(e) => {
                         let _ = tx.send(ServerEvent::Log(format!("{peer}: bad packet: {e}")));
                         // Say so, rather than leaving the client to retransmit
-                        // an unparseable request until its own timeout.
-                        send_error(local_addr, interface.as_ref(), peer, 4, "Illegal TFTP operation").await;
+                        // an unparseable request until its own timeout. The
+                        // budget keeps that from turning a well-known UDP port
+                        // into an amplifier: the reply is longer than the two
+                        // bytes needed to provoke it, and the source address
+                        // is not verified.
+                        if malformed_replies.take() {
+                            send_error(local_addr, interface.as_ref(), peer, 4, "Illegal TFTP operation").await;
+                        }
                         continue;
                     }
                 };
@@ -778,6 +785,43 @@ async fn run_inner(
         }
     }
     Ok(())
+}
+
+/// A token bucket limiting how often the listener answers a datagram it could
+/// not parse.
+///
+/// Those replies go to an unverified source address and are longer than the
+/// request that triggers them, so answering every one turns the server into a
+/// reflector. Legitimate clients send one malformed request at most.
+struct ReplyBudget {
+    tokens: u32,
+    refilled_at: Instant,
+}
+
+impl ReplyBudget {
+    /// Replies allowed in a burst, and restored per second.
+    const RATE: u32 = 16;
+
+    fn new() -> Self {
+        Self {
+            tokens: Self::RATE,
+            refilled_at: Instant::now(),
+        }
+    }
+
+    fn take(&mut self) -> bool {
+        let elapsed = self.refilled_at.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            let restored = elapsed.as_secs().min(u64::from(Self::RATE)) as u32 * Self::RATE;
+            self.tokens = self.tokens.saturating_add(restored).min(Self::RATE);
+            self.refilled_at = Instant::now();
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
 }
 
 /// Longest the server will wait after a completed upload for the client to
