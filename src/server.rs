@@ -1139,12 +1139,23 @@ async fn handle_rrq(
                                     retries = 0;
                                     continue;
                                 }
-                                // ACK for a block outside the window.
-                                retries += 1;
-                                if retries > max_retries {
-                                    return Err(anyhow!(
-                                        "no usable acknowledgment after {max_retries} attempts"
-                                    ));
+                                // Re-acknowledging the block before this
+                                // window is how an RFC 7440 client reports
+                                // that the window's first block went missing.
+                                // That is ordinary recovery, so it does not
+                                // spend the retry budget; resending the window
+                                // is the correct answer.
+                                let previous_window_end =
+                                    window.first().map(|(bn, _)| bn.wrapping_sub(1));
+                                if Some(bn) != previous_window_end {
+                                    // Any other block is outside the
+                                    // conversation entirely.
+                                    retries += 1;
+                                    if retries > max_retries {
+                                        return Err(anyhow!(
+                                            "no usable acknowledgment after {max_retries} attempts"
+                                        ));
+                                    }
                                 }
                             }
                             Packet::ERROR { code, msg } => {
