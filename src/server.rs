@@ -554,6 +554,10 @@ fn negotiate_options(
 ///
 /// Callers that want to refuse wildcard listeners can check with
 /// [`validate_bind_addr`] first.
+///
+/// `tx` carries progress and log events for a caller that wants to display
+/// them. It is not part of the transfer path: dropping the receiver stops the
+/// events and nothing else, and the server goes on serving files.
 pub async fn run(
     bind_addr: SocketAddr,
     dir: PathBuf,
@@ -647,7 +651,7 @@ async fn run_inner(
         ),
         None => format!("Listening on {local_addr}"),
     };
-    tx.send(ServerEvent::Log(listener_description))?;
+    let _ = tx.send(ServerEvent::Log(listener_description));
 
     let detected_blksize = max_blksize();
     let effective_max_blksize = if config.max_block_size > 0 {
@@ -655,19 +659,19 @@ async fn run_inner(
     } else {
         detected_blksize
     };
-    tx.send(ServerEvent::Log(format!(
+    let _ = tx.send(ServerEvent::Log(format!(
         "Max negotiable blksize: {effective_max_blksize}"
-    )))?;
+    )));
     if config.max_window_size > 1 {
-        tx.send(ServerEvent::Log(format!(
+        let _ = tx.send(ServerEvent::Log(format!(
             "Max window size: {}",
             config.max_window_size
-        )))?;
+        )));
     }
-    tx.send(ServerEvent::Log(format!(
+    let _ = tx.send(ServerEvent::Log(format!(
         "Default timeout: {}ms",
         config.timeout_ms
-    )))?;
+    )));
 
     let dir = Arc::new(dir);
     let config = Arc::new(config);
@@ -779,7 +783,7 @@ async fn run_inner(
                 }
             }
             _ = shutdown.changed() => {
-                tx.send(ServerEvent::Log("Shutting down".into()))?;
+                let _ = tx.send(ServerEvent::Log("Shutting down".into()));
                 break;
             }
         }
@@ -1003,10 +1007,10 @@ async fn handle_rrq(
         format!(" [{}]", detail_parts.join(", "))
     };
 
-    tx.send(ServerEvent::Log(format!(
+    let _ = tx.send(ServerEvent::Log(format!(
         "{peer}: RRQ \"{filename}\" ({total_bytes} bytes){detail_str}"
-    )))?;
-    tx.send(ServerEvent::TransferStarted(TransferInfo {
+    )));
+    let _ = tx.send(ServerEvent::TransferStarted(TransferInfo {
         id,
         peer,
         filename: filename.to_string(),
@@ -1015,7 +1019,7 @@ async fn handle_rrq(
         transferred: 0,
         started: Instant::now(),
         size_known: true,
-    }))?;
+    }));
 
     // Bind an ephemeral socket for this transfer with appropriately sized buffers.
     let sock = bind_transfer_socket(local_addr, interface.as_ref(), peer, blksize).await?;
@@ -1228,11 +1232,11 @@ async fn handle_rrq(
                 }
             }
 
-            tx.send(ServerEvent::TransferProgress {
+            let _ = tx.send(ServerEvent::TransferProgress {
                 id,
                 transferred,
                 total_bytes,
-            })?;
+            });
 
             if last_block {
                 break;
@@ -1296,11 +1300,11 @@ async fn handle_rrq(
             }
 
             transferred += payload.len() as u64;
-            tx.send(ServerEvent::TransferProgress {
+            let _ = tx.send(ServerEvent::TransferProgress {
                 id,
                 transferred,
                 total_bytes,
-            })?;
+            });
 
             if is_last {
                 break;
@@ -1309,10 +1313,10 @@ async fn handle_rrq(
         }
     }
 
-    tx.send(ServerEvent::TransferComplete(id))?;
-    tx.send(ServerEvent::Log(format!(
+    let _ = tx.send(ServerEvent::TransferComplete(id));
+    let _ = tx.send(ServerEvent::Log(format!(
         "{peer}: RRQ \"{filename}\" complete ({transferred} bytes transferred)"
-    )))?;
+    )));
     Ok(())
 }
 
@@ -1458,9 +1462,9 @@ async fn handle_wrq(
         format!(" [{}]", detail_parts.join(", "))
     };
 
-    tx.send(ServerEvent::Log(format!(
+    let _ = tx.send(ServerEvent::Log(format!(
         "{peer}: WRQ \"{filename}\"{detail_str}"
-    )))?;
+    )));
 
     // Try to determine expected size from tsize option.
     let expected_size = options
@@ -1468,7 +1472,7 @@ async fn handle_wrq(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
 
-    tx.send(ServerEvent::TransferStarted(TransferInfo {
+    let _ = tx.send(ServerEvent::TransferStarted(TransferInfo {
         id,
         peer,
         filename: filename.to_string(),
@@ -1477,7 +1481,7 @@ async fn handle_wrq(
         transferred: 0,
         started: Instant::now(),
         size_known: expected_size > 0,
-    }))?;
+    }));
 
     let sock = bind_transfer_socket(local_addr, interface.as_ref(), peer, blksize).await?;
     let mut recv_buf = vec![0u8; MAX_PACKET];
@@ -1656,11 +1660,11 @@ async fn handle_wrq(
             } else {
                 transferred
             };
-            tx.send(ServerEvent::TransferProgress {
+            let _ = tx.send(ServerEvent::TransferProgress {
                 id,
                 transferred,
                 total_bytes: report_total,
-            })?;
+            });
 
             if last_block {
                 last_block_num = expected_block.wrapping_sub(1);
@@ -1753,11 +1757,11 @@ async fn handle_wrq(
             } else {
                 transferred
             };
-            tx.send(ServerEvent::TransferProgress {
+            let _ = tx.send(ServerEvent::TransferProgress {
                 id,
                 transferred,
                 total_bytes: report_total,
-            })?;
+            });
 
             if is_last {
                 last_block_num = expected_block;
@@ -1831,10 +1835,10 @@ async fn handle_wrq(
         }
     }
 
-    tx.send(ServerEvent::TransferComplete(id))?;
-    tx.send(ServerEvent::Log(format!(
+    let _ = tx.send(ServerEvent::TransferComplete(id));
+    let _ = tx.send(ServerEvent::Log(format!(
         "{peer}: WRQ \"{filename}\" complete ({transferred} bytes)"
-    )))?;
+    )));
 
     // RFC 1350 dallying, after the file is already in place: if the final ACK
     // was lost the client resends and would otherwise report a failure for an

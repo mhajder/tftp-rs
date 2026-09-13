@@ -456,6 +456,64 @@ async fn a_request_for_a_missing_file_is_answered_with_an_error() {
 }
 
 #[tokio::test]
+async fn transfers_survive_a_caller_that_stops_reading_events() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    tokio::fs::write(dir.path().join("hello.txt"), b"AROS")
+        .await
+        .expect("test file");
+
+    let reservation = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("reserve test port");
+    let listener_address = reservation.local_addr().expect("listener address");
+    drop(reservation);
+
+    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server_dir = dir.path().to_path_buf();
+    let server = tokio::spawn(async move {
+        run(
+            listener_address,
+            server_dir,
+            events,
+            shutdown_rx,
+            ServerConfig::default(),
+        )
+        .await
+    });
+
+    wait_until_listening(&mut event_rx).await;
+
+    // An embedder that only wanted a file server, and never a dashboard, has
+    // no reason to keep draining events. That must cost it the events alone.
+    drop(event_rx);
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    client
+        .send_to(&rrq("hello.txt"), listener_address)
+        .await
+        .expect("RRQ");
+
+    let mut buffer = [0_u8; 516];
+    let (length, transfer) =
+        tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+            .await
+            .expect("the transfer must run without anyone listening to the events")
+            .expect("datagram");
+
+    assert_eq!(&buffer[..4], &[0, 3, 0, 1]);
+    assert_eq!(&buffer[4..length], b"AROS");
+
+    client.send_to(&[0, 4, 0, 1], transfer).await.expect("ACK");
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server
+        .await
+        .expect("server task")
+        .expect("a shutdown with no event receiver is still a clean shutdown");
+}
+
+#[tokio::test]
 async fn a_netascii_download_does_not_acknowledge_tsize() {
     let dir = tempfile::tempdir().expect("temporary directory");
     // Six bytes on disk, nine on the wire: each LF is sent as CR LF.
