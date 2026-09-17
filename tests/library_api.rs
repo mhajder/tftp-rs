@@ -601,6 +601,163 @@ async fn a_netascii_download_does_not_acknowledge_tsize() {
 }
 
 #[tokio::test]
+async fn unanswered_requests_cannot_take_more_than_their_share_of_sockets() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    tokio::fs::write(dir.path().join("big.bin"), vec![7_u8; 4096])
+        .await
+        .expect("test file");
+
+    let reservation = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("reserve test port");
+    let listener_address = reservation.local_addr().expect("listener address");
+    drop(reservation);
+
+    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server_dir = dir.path().to_path_buf();
+    let server = tokio::spawn(async move {
+        run(
+            listener_address,
+            server_dir,
+            events,
+            shutdown_rx,
+            ServerConfig {
+                max_concurrent_transfers: 4,
+                ..ServerConfig::default()
+            },
+        )
+        .await
+    });
+
+    wait_until_listening(&mut event_rx).await;
+
+    // Each of these takes a slot and never acknowledges anything, so all four
+    // stay held for the whole retry budget.
+    let mut hoarders = Vec::new();
+    for _ in 0..4 {
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+        client
+            .send_to(&rrq("big.bin"), listener_address)
+            .await
+            .expect("RRQ");
+        hoarders.push(client);
+    }
+
+    // Wait until every slot is actually taken, rather than guessing at a delay.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut started = 0;
+    while started < 4 {
+        let event = tokio::time::timeout_at(deadline, event_rx.recv())
+            .await
+            .expect("the four transfers must start")
+            .expect("event channel");
+        if matches!(event, ServerEvent::TransferStarted(_)) {
+            started += 1;
+        }
+    }
+
+    let refused = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    refused
+        .send_to(&rrq("big.bin"), listener_address)
+        .await
+        .expect("RRQ");
+
+    // The fifth gets nothing: answering a flood packet for packet is what the
+    // limit exists to avoid. A real client retransmits and gets in later.
+    let mut buffer = [0_u8; 616];
+    let answered =
+        tokio::time::timeout(Duration::from_millis(400), refused.recv_from(&mut buffer)).await;
+    assert!(
+        answered.is_err(),
+        "a request over the limit must not be given a transfer socket"
+    );
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
+
+#[tokio::test]
+async fn an_upload_past_the_size_limit_is_cut_off() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+
+    let reservation = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("reserve test port");
+    let listener_address = reservation.local_addr().expect("listener address");
+    drop(reservation);
+
+    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server_dir = dir.path().to_path_buf();
+    let server = tokio::spawn(async move {
+        run(
+            listener_address,
+            server_dir,
+            events,
+            shutdown_rx,
+            ServerConfig {
+                max_upload_bytes: 1000,
+                ..ServerConfig::default()
+            },
+        )
+        .await
+    });
+
+    wait_until_listening(&mut event_rx).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    let mut request = Vec::from(&2_u16.to_be_bytes()[..]);
+    request.extend_from_slice(b"flood.bin\0octet\0");
+    client
+        .send_to(&request, listener_address)
+        .await
+        .expect("WRQ");
+
+    let mut buffer = [0_u8; 616];
+    let (_, from) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("ACK 0 timeout")
+        .expect("datagram");
+    assert_eq!(&buffer[..4], &[0, 4, 0, 0]);
+
+    // Full blocks, so the transfer never signals an end of its own. The third
+    // one carries the total past 1000 bytes.
+    let mut block = 1_u16;
+    let error_code = loop {
+        assert!(block <= 8, "the server never stopped the upload");
+        let mut data = Vec::from(&3_u16.to_be_bytes()[..]);
+        data.extend_from_slice(&block.to_be_bytes());
+        data.extend_from_slice(&vec![9_u8; 512]);
+        client.send_to(&data, from).await.expect("DATA");
+
+        let (_, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+            .await
+            .expect("no answer to a DATA block")
+            .expect("datagram");
+        if buffer[..2] == [0, 5] {
+            break u16::from_be_bytes([buffer[2], buffer[3]]);
+        }
+        assert_eq!(&buffer[..2], &[0, 4], "expected ACK or ERROR");
+        block += 1;
+    };
+
+    // Code 3, "disk full or allocation exceeded".
+    assert_eq!(error_code, 3);
+
+    // Nothing oversized is left behind, staging file included.
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("served directory")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(leftovers.is_empty(), "unexpected leftovers: {leftovers:?}");
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
+
+#[tokio::test]
 async fn a_filename_cannot_forge_a_line_in_the_log() {
     let dir = tempfile::tempdir().expect("temporary directory");
 

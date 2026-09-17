@@ -29,6 +29,13 @@ const DEFAULT_TIMEOUT_MS: u64 = 500;
 /// Maximum retransmission attempts before giving up.
 const MAX_RETRIES: u32 = 10;
 
+/// How many transfers may run at once before further requests are turned away.
+///
+/// Two file descriptors per transfer, so this leaves a wide margin under the
+/// 1024-descriptor limit a service is commonly given, while being far more
+/// than the number of clients a TFTP server is ever asked to serve at once.
+const DEFAULT_MAX_CONCURRENT_TRANSFERS: usize = 256;
+
 /// The largest TFTP blksize the OS will allow in a single UDP send.
 /// Detected once at startup by probing the kernel.
 static MAX_SENDABLE_BLKSIZE: OnceLock<usize> = OnceLock::new();
@@ -57,6 +64,22 @@ pub struct ServerConfig {
     pub enable_read: bool,
     /// Whether to enable write (WRQ) requests.
     pub enable_write: bool,
+    /// How many transfers may be in flight at once. 0 means no limit.
+    ///
+    /// Every transfer holds a socket and an open file until it finishes or
+    /// runs out of retries, so an unanswered request costs two file
+    /// descriptors for `max_retries` timeouts. Without a limit, enough
+    /// unanswered requests exhaust the process's descriptor table, and from
+    /// then on no client can be given a transfer socket.
+    pub max_concurrent_transfers: usize,
+    /// Largest upload accepted, in bytes. 0 means no limit.
+    ///
+    /// Defaults to no limit: this server exists to hand out firmware and
+    /// configuration, and a ceiling low enough to be worth having for one
+    /// deployment would cut off ordinary uploads in another. Set it where the
+    /// served directory shares a filesystem with something that must not run
+    /// out of space.
+    pub max_upload_bytes: u64,
 }
 
 impl Default for ServerConfig {
@@ -69,6 +92,8 @@ impl Default for ServerConfig {
             max_retries: MAX_RETRIES,
             enable_read: true,
             enable_write: true,
+            max_concurrent_transfers: DEFAULT_MAX_CONCURRENT_TRANSFERS,
+            max_upload_bytes: 0,
         }
     }
 }
@@ -719,6 +744,15 @@ async fn run_inner(
     let reqs_in_progress: Arc<tokio::sync::Mutex<HashSet<SocketAddr>>> =
         Arc::new(tokio::sync::Mutex::new(HashSet::new()));
 
+    // One permit per transfer in flight, released when its task ends.
+    let transfer_slots = Arc::new(tokio::sync::Semaphore::new(
+        if config.max_concurrent_transfers == 0 {
+            tokio::sync::Semaphore::MAX_PERMITS
+        } else {
+            config.max_concurrent_transfers
+        },
+    ));
+
     loop {
         tokio::select! {
             result = sock.recv_from(&mut buf) => {
@@ -748,6 +782,15 @@ async fn run_inner(
                             continue;
                         }
 
+                        // Take a slot before anything is allocated for this
+                        // transfer. Turning the request away silently keeps a
+                        // flood from being answered packet for packet; a real
+                        // client retransmits and gets in once a slot frees.
+                        let Ok(slot) = Arc::clone(&transfer_slots).try_acquire_owned() else {
+                            let _ = tx.send(log_event(format!("{peer}: RRQ refused (too many transfers in progress)")));
+                            continue;
+                        };
+
                         // Reject duplicate request from same peer.
                         {
                             let mut in_progress = reqs_in_progress.lock().await;
@@ -767,6 +810,7 @@ async fn run_inner(
                         tokio::spawn(async move {
                             let result = handle_rrq(TransferContext { id, peer, local_addr, interface: interface2, dir: dir2, tx: tx2.clone(), config: cfg }, &filename, &mode, &options).await;
                             rip.lock().await.remove(&peer);
+                            drop(slot);
                             if let Err(e) = result {
                                 let _ = tx2.send(ServerEvent::TransferFailed { id, error: e.to_string() });
                                 let _ = tx2.send(log_event(format!("{peer}: RRQ error: {e}")));
@@ -779,6 +823,15 @@ async fn run_inner(
                             send_error(local_addr, interface.as_ref(), peer, 2, "Write access denied").await;
                             continue;
                         }
+
+                        // Take a slot before anything is allocated for this
+                        // transfer. Turning the request away silently keeps a
+                        // flood from being answered packet for packet; a real
+                        // client retransmits and gets in once a slot frees.
+                        let Ok(slot) = Arc::clone(&transfer_slots).try_acquire_owned() else {
+                            let _ = tx.send(log_event(format!("{peer}: WRQ refused (too many transfers in progress)")));
+                            continue;
+                        };
 
                         // Reject duplicate request from same peer.
                         {
@@ -799,6 +852,7 @@ async fn run_inner(
                         tokio::spawn(async move {
                             let result = handle_wrq(TransferContext { id, peer, local_addr, interface: interface2, dir: dir2.clone(), tx: tx2.clone(), config: cfg }, &filename, &mode, &options).await;
                             rip.lock().await.remove(&peer);
+                            drop(slot);
                             if let Err(e) = result {
                                 // Clean up this transfer's staging file. The
                                 // id keeps it distinct from any other upload
@@ -1522,6 +1576,21 @@ async fn handle_wrq(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
 
+    // A client that declares its size up front can be turned away before it
+    // sends anything. One that does not is stopped mid-transfer instead, by
+    // the check on each block below.
+    if config.max_upload_bytes > 0 && expected_size > config.max_upload_bytes {
+        let failure = RequestFailure::new(
+            3,
+            "Disk full or allocation exceeded",
+            anyhow!(
+                "declared size {expected_size} exceeds the {} byte limit",
+                config.max_upload_bytes
+            ),
+        );
+        return Err(report_failure(local_addr, interface.as_ref(), peer, failure).await);
+    }
+
     let _ = tx.send(ServerEvent::TransferStarted(TransferInfo {
         id,
         peer,
@@ -1695,6 +1764,7 @@ async fn handle_wrq(
                 };
                 file.write_all(&to_write).await?;
                 transferred += to_write.len() as u64;
+                refuse_oversized_upload(&sock, transferred, config.max_upload_bytes).await?;
             }
 
             // ACK the last block we received.
@@ -1795,6 +1865,7 @@ async fn handle_wrq(
             // Write directly to disk.
             file.write_all(&to_write).await?;
             transferred += to_write.len() as u64;
+            refuse_oversized_upload(&sock, transferred, config.max_upload_bytes).await?;
 
             // ACK this block.
             let ack = Packet::ACK {
@@ -1924,6 +1995,24 @@ async fn handle_wrq(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Stop an upload that has grown past the configured ceiling.
+///
+/// The error goes out on the transfer's own socket, because the client is
+/// already talking to it and RFC 1350 has it discard anything arriving from
+/// anywhere else. Returning an error leaves the caller to clean up the staging
+/// file, so nothing oversized is left behind.
+async fn refuse_oversized_upload(sock: &UdpSocket, transferred: u64, limit: u64) -> Result<()> {
+    if limit == 0 || transferred <= limit {
+        return Ok(());
+    }
+    let error = Packet::ERROR {
+        code: 3,
+        msg: "Disk full or allocation exceeded".into(),
+    };
+    let _ = send_resilient(sock, &error.to_bytes()).await;
+    Err(anyhow!("upload exceeded the {limit} byte limit"))
+}
 
 /// Ensure the requested filename stays inside the served directory.
 /// Supports subdirectory paths (e.g. `ios/config/router.cfg`) while
