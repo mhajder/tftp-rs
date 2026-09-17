@@ -31,6 +31,7 @@ tsize, windowsize), netascii mode, and an optional HTTP file server.
 - **Overwrite protection** -- WRQ for existing files can be rejected with `--allow-overwrite false` (returns error code 6)
 - **Access control** -- `--disable-read` or `--disable-write` to restrict what operations clients may perform (`--disable-read` refuses to run alongside `--http-port`, which would hand out the same files anyway)
 - **Configurable retransmission** -- `--timeout` (ms) and `--max-retries` to tune behaviour for unstable networks
+- **Resource limits** -- `--max-concurrent-transfers` (default 256) bounds the sockets and open files unanswered requests can tie up; `--max-upload-size` caps what a single upload may write (off by default)
 - **HTTP file server** -- optional HTTP server for browser-based directory browsing and file downloads (`--http-port`)
 - **TUI dashboard** -- real-time view of server status, shared files tree, active transfers with progress bars, and timestamped scrollable logs
 - **Interface discovery** -- with the default wildcard bind, displays the host's non-loopback IPv4 addresses in the header (auto-refreshes every 10 seconds); adding `--interface` narrows that to the named device's IPv4 addresses, loopback included, because those are the ones the server answers on; with an explicit `--bind` it shows the one address in use
@@ -111,6 +112,8 @@ Options:
   -w, --max-window-size <N>          Max RFC 7440 window size (1 = disable) [default: 1]
       --allow-overwrite <BOOL>       Allow overwriting existing files on WRQ [default: true]
       --max-retries <N>              Max retransmission attempts [default: 10]
+      --max-concurrent-transfers <N> Transfers in flight at once (0 = unlimited) [default: 256]
+      --max-upload-size <BYTES>      Reject an upload past this size (0 = unlimited) [default: 0]
       --disable-read                 Reject all RRQ (download) requests
       --disable-write                Reject all WRQ (upload) requests
   -h, --help                         Print help

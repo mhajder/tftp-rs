@@ -87,6 +87,16 @@ struct Cli {
     #[arg(long, default_value_t = 10)]
     max_retries: u32,
 
+    /// Maximum number of transfers in flight at once. Each one holds a socket
+    /// and an open file, so this bounds the descriptors the server can use.
+    /// 0 = unlimited.
+    #[arg(long, default_value_t = 256)]
+    max_concurrent_transfers: usize,
+
+    /// Reject an upload once it passes this many bytes. 0 = unlimited.
+    #[arg(long, default_value_t = 0)]
+    max_upload_size: u64,
+
     /// Disable read (RRQ) requests. Only uploads will be accepted. Cannot be
     /// combined with --http-port, which would keep serving the same files.
     #[arg(long)]
@@ -166,6 +176,8 @@ async fn main() -> Result<()> {
         max_retries: cli.max_retries,
         enable_read: !cli.disable_read,
         enable_write: !cli.disable_write,
+        max_concurrent_transfers: cli.max_concurrent_transfers,
+        max_upload_bytes: cli.max_upload_size,
     };
 
     // Spawn the TFTP server in the background.
