@@ -457,6 +457,42 @@ pub enum ServerEvent {
     },
 }
 
+/// Render text as a single line, with control characters escaped.
+///
+/// Filenames arrive from the network, and a log is read a line at a time. A
+/// client asking for a file whose name holds a newline would otherwise end the
+/// entry early and have everything after it read as a second, entirely
+/// invented entry: a forged request, from a forged address, needing no valid
+/// file and no write access. Terminals read control characters as instructions
+/// of their own, which is the same problem wearing a different hat.
+///
+/// Every [`ServerEvent::Log`] this crate emits has already been passed through
+/// here. It is public for callers that build log lines of their own from a
+/// [`TransferInfo::filename`], which is kept verbatim because it is the name of
+/// a file rather than a message about one.
+pub fn single_line(text: &str) -> String {
+    if !text.contains(|c: char| c.is_control()) {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:04x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Build a [`ServerEvent::Log`] that is safe to write to a log a line at a time.
+fn log_event(message: String) -> ServerEvent {
+    ServerEvent::Log(single_line(&message))
+}
+
 // ---------------------------------------------------------------------------
 // Option negotiation helpers
 // ---------------------------------------------------------------------------
@@ -651,7 +687,7 @@ async fn run_inner(
         ),
         None => format!("Listening on {local_addr}"),
     };
-    let _ = tx.send(ServerEvent::Log(listener_description));
+    let _ = tx.send(log_event(listener_description));
 
     let detected_blksize = max_blksize();
     let effective_max_blksize = if config.max_block_size > 0 {
@@ -659,16 +695,16 @@ async fn run_inner(
     } else {
         detected_blksize
     };
-    let _ = tx.send(ServerEvent::Log(format!(
+    let _ = tx.send(log_event(format!(
         "Max negotiable blksize: {effective_max_blksize}"
     )));
     if config.max_window_size > 1 {
-        let _ = tx.send(ServerEvent::Log(format!(
+        let _ = tx.send(log_event(format!(
             "Max window size: {}",
             config.max_window_size
         )));
     }
-    let _ = tx.send(ServerEvent::Log(format!(
+    let _ = tx.send(log_event(format!(
         "Default timeout: {}ms",
         config.timeout_ms
     )));
@@ -690,7 +726,7 @@ async fn run_inner(
                 let pkt = match Packet::from_bytes(&buf[..n]) {
                     Ok(p) => p,
                     Err(e) => {
-                        let _ = tx.send(ServerEvent::Log(format!("{peer}: bad packet: {e}")));
+                        let _ = tx.send(log_event(format!("{peer}: bad packet: {e}")));
                         // Say so, rather than leaving the client to retransmit
                         // an unparseable request until its own timeout. The
                         // budget keeps that from turning a well-known UDP port
@@ -707,7 +743,7 @@ async fn run_inner(
                 match pkt {
                     Packet::RRQ { filename, mode, options } => {
                         if !config.enable_read {
-                            let _ = tx.send(ServerEvent::Log(format!("{peer}: RRQ rejected (reads disabled)")));
+                            let _ = tx.send(log_event(format!("{peer}: RRQ rejected (reads disabled)")));
                             send_error(local_addr, interface.as_ref(), peer, 2, "Read access denied").await;
                             continue;
                         }
@@ -716,7 +752,7 @@ async fn run_inner(
                         {
                             let mut in_progress = reqs_in_progress.lock().await;
                             if !in_progress.insert(peer) {
-                                let _ = tx.send(ServerEvent::Log(format!("{peer}: duplicate RRQ ignored (transfer in progress)")));
+                                let _ = tx.send(log_event(format!("{peer}: duplicate RRQ ignored (transfer in progress)")));
                                 continue;
                             }
                         }
@@ -733,13 +769,13 @@ async fn run_inner(
                             rip.lock().await.remove(&peer);
                             if let Err(e) = result {
                                 let _ = tx2.send(ServerEvent::TransferFailed { id, error: e.to_string() });
-                                let _ = tx2.send(ServerEvent::Log(format!("{peer}: RRQ error: {e}")));
+                                let _ = tx2.send(log_event(format!("{peer}: RRQ error: {e}")));
                             }
                         });
                     }
                     Packet::WRQ { filename, mode, options } => {
                         if !config.enable_write {
-                            let _ = tx.send(ServerEvent::Log(format!("{peer}: WRQ rejected (writes disabled)")));
+                            let _ = tx.send(log_event(format!("{peer}: WRQ rejected (writes disabled)")));
                             send_error(local_addr, interface.as_ref(), peer, 2, "Write access denied").await;
                             continue;
                         }
@@ -748,7 +784,7 @@ async fn run_inner(
                         {
                             let mut in_progress = reqs_in_progress.lock().await;
                             if !in_progress.insert(peer) {
-                                let _ = tx.send(ServerEvent::Log(format!("{peer}: duplicate WRQ ignored (transfer in progress)")));
+                                let _ = tx.send(log_event(format!("{peer}: duplicate WRQ ignored (transfer in progress)")));
                                 continue;
                             }
                         }
@@ -771,19 +807,19 @@ async fn run_inner(
                                     let _ = tokio::fs::remove_file(part_path(&final_path, id)).await;
                                 }
                                 let _ = tx2.send(ServerEvent::TransferFailed { id, error: e.to_string() });
-                                let _ = tx2.send(ServerEvent::Log(format!("{peer}: WRQ error: {e}")));
+                                let _ = tx2.send(log_event(format!("{peer}: WRQ error: {e}")));
                             }
                         });
                     }
                     other => {
-                        let _ = tx.send(ServerEvent::Log(format!(
+                        let _ = tx.send(log_event(format!(
                             "{peer}: unexpected packet on listener: {other:?}"
                         )));
                     }
                 }
             }
             _ = shutdown.changed() => {
-                let _ = tx.send(ServerEvent::Log("Shutting down".into()));
+                let _ = tx.send(log_event("Shutting down".into()));
                 break;
             }
         }
@@ -1007,7 +1043,7 @@ async fn handle_rrq(
         format!(" [{}]", detail_parts.join(", "))
     };
 
-    let _ = tx.send(ServerEvent::Log(format!(
+    let _ = tx.send(log_event(format!(
         "{peer}: RRQ \"{filename}\" ({total_bytes} bytes){detail_str}"
     )));
     let _ = tx.send(ServerEvent::TransferStarted(TransferInfo {
@@ -1314,7 +1350,7 @@ async fn handle_rrq(
     }
 
     let _ = tx.send(ServerEvent::TransferComplete(id));
-    let _ = tx.send(ServerEvent::Log(format!(
+    let _ = tx.send(log_event(format!(
         "{peer}: RRQ \"{filename}\" complete ({transferred} bytes transferred)"
     )));
     Ok(())
@@ -1478,9 +1514,7 @@ async fn handle_wrq(
         format!(" [{}]", detail_parts.join(", "))
     };
 
-    let _ = tx.send(ServerEvent::Log(format!(
-        "{peer}: WRQ \"{filename}\"{detail_str}"
-    )));
+    let _ = tx.send(log_event(format!("{peer}: WRQ \"{filename}\"{detail_str}")));
 
     // Try to determine expected size from tsize option.
     let expected_size = options
@@ -1852,7 +1886,7 @@ async fn handle_wrq(
     }
 
     let _ = tx.send(ServerEvent::TransferComplete(id));
-    let _ = tx.send(ServerEvent::Log(format!(
+    let _ = tx.send(log_event(format!(
         "{peer}: WRQ \"{filename}\" complete ({transferred} bytes)"
     )));
 
@@ -2026,6 +2060,18 @@ mod tests {
         // New file in a non-existent subdirectory (for WRQ).
         let result = sanitize_path(dir.path(), "new_dir/file.bin").unwrap();
         assert!(result.ends_with("new_dir/file.bin"));
+    }
+
+    #[test]
+    fn single_line_escapes_what_would_forge_an_entry() {
+        assert_eq!(single_line("plain message"), "plain message");
+        assert_eq!(single_line("a\n[00:00:00] forged"), "a\\n[00:00:00] forged");
+        assert_eq!(single_line("carriage\rreturn"), "carriage\\rreturn");
+        assert_eq!(single_line("tab\there"), "tab\\there");
+        // An escape sequence a terminal would act on rather than print.
+        assert_eq!(single_line("clear\u{1b}[2J"), "clear\\u{001b}[2J");
+        // Text outside ASCII is not a control character and is left alone.
+        assert_eq!(single_line("firmware-é.bin"), "firmware-é.bin");
     }
 
     #[test]

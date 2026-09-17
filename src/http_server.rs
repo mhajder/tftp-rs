@@ -11,7 +11,7 @@ use axum::response::{Html, IntoResponse, Response};
 use tokio::sync::{mpsc, watch};
 use tokio_util::io::ReaderStream;
 
-use tftp_rs::server::{ServerEvent, sanitize_path};
+use tftp_rs::server::{ServerEvent, sanitize_path, single_line};
 
 struct HttpState {
     dir: PathBuf,
@@ -64,10 +64,12 @@ async fn serve_path(
     let uri_path = percent_decode(request.uri().path());
     let stripped = uri_path.trim_start_matches('/');
 
+    // The request path is decoded above, so %0A is a real newline by now and
+    // would split this entry in two in the log file.
     let method = request.method().clone();
-    let _ = state.tx.send(ServerEvent::Log(format!(
+    let _ = state.tx.send(ServerEvent::Log(single_line(&format!(
         "{addr}: HTTP {method} /{stripped}"
-    )));
+    ))));
 
     // Root directory listing.
     if stripped.is_empty() {
