@@ -11,7 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph};
 
-use tftp_rs::server::{TransferInfo, TransferKind};
+use tftp_rs::server::{TransferInfo, TransferKind, single_line};
 
 /// How many log lines the dashboard keeps in memory.
 const MAX_LOG_LINES: usize = 2_000;
@@ -117,7 +117,11 @@ impl App {
 
     pub fn push_log(&mut self, msg: String) {
         let ts = timestamp_now();
-        let line = format!("{ts} {msg}");
+        // The last place a log line can still be made of more than one line.
+        // Messages from the server arrive escaped already, but the dashboard
+        // also builds its own out of a transfer's filename, which is whatever
+        // the client asked for.
+        let line = format!("{ts} {}", single_line(&msg));
 
         if let Some(ref mut w) = self.log_writer {
             let _ = writeln!(w, "{line}");
