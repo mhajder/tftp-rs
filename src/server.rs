@@ -1415,6 +1415,22 @@ async fn handle_wrq(
         }
     };
 
+    // A directory, a device node or a socket cannot be replaced by the rename
+    // that promotes a finished upload. Left to be discovered at that point, the
+    // client has already sent the whole file and had every block acknowledged,
+    // so it is told the upload arrived and only the server ever learns it did
+    // not. The target has to be ruled out before the first acknowledgment.
+    if let Ok(metadata) = tokio::fs::metadata(&path).await
+        && !metadata.is_file()
+    {
+        let failure = RequestFailure::new(
+            2,
+            "Access violation",
+            anyhow!("not a regular file: {}", path.display()),
+        );
+        return Err(report_failure(local_addr, interface.as_ref(), peer, failure).await);
+    }
+
     // Overwrite protection.
     if !config.allow_overwrite && path.exists() {
         // Send error to client on a temporary socket.

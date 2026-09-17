@@ -601,6 +601,66 @@ async fn a_netascii_download_does_not_acknowledge_tsize() {
 }
 
 #[tokio::test]
+async fn an_upload_onto_a_directory_is_refused_before_it_starts() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    std::fs::create_dir(dir.path().join("taken")).expect("a directory in the way");
+
+    let reservation = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("reserve test port");
+    let listener_address = reservation.local_addr().expect("listener address");
+    drop(reservation);
+
+    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server_dir = dir.path().to_path_buf();
+    let server = tokio::spawn(async move {
+        run(
+            listener_address,
+            server_dir,
+            events,
+            shutdown_rx,
+            ServerConfig::default(),
+        )
+        .await
+    });
+
+    wait_until_listening(&mut event_rx).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    let mut request = Vec::from(&2_u16.to_be_bytes()[..]);
+    request.extend_from_slice(b"taken\0octet\0");
+    client
+        .send_to(&request, listener_address)
+        .await
+        .expect("WRQ");
+
+    let mut buffer = [0_u8; 512];
+    let (length, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("the client must not be left waiting for its own timeout")
+        .expect("datagram");
+
+    // ERROR, code 2 (access violation). An ACK here would start an upload that
+    // can never be stored, and the client would be told it succeeded.
+    assert_eq!(&buffer[..4], &[0, 5, 0, 2]);
+    assert_eq!(buffer[length - 1], 0);
+
+    // The directory is untouched, and no staging file was left beside it.
+    assert!(dir.path().join("taken").is_dir());
+    let strays: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("served directory")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|name| name != "taken")
+        .collect();
+    assert!(strays.is_empty(), "unexpected leftovers: {strays:?}");
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
+
+#[tokio::test]
 async fn a_request_for_a_directory_is_answered_with_an_error() {
     let dir = tempfile::tempdir().expect("temporary directory");
     std::fs::create_dir(dir.path().join("subdir")).expect("a directory to request");
