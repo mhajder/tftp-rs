@@ -87,7 +87,8 @@ struct Cli {
     #[arg(long, default_value_t = 10)]
     max_retries: u32,
 
-    /// Disable read (RRQ) requests. Only uploads will be accepted.
+    /// Disable read (RRQ) requests. Only uploads will be accepted. Cannot be
+    /// combined with --http-port, which would keep serving the same files.
     #[arg(long)]
     disable_read: bool,
 
@@ -112,6 +113,17 @@ async fn main() -> Result<()> {
     }
     server::probe_bind(tftp_addr, cli.interface.as_deref())
         .with_context(|| format!("cannot bind TFTP server to {tftp_addr}"))?;
+
+    // The HTTP file server hands out the same directory, and --disable-read
+    // only ever reached the TFTP handlers. Asking for both told the operator
+    // reads were off while every file stayed downloadable over HTTP, with no
+    // hint that the flag had been overtaken. Refusing the combination says so
+    // plainly and leaves the choice with whoever wrote the command line.
+    if cli.disable_read && cli.http_port.is_some() {
+        anyhow::bail!(
+            "--http-port serves the same directory over HTTP, which --disable-read forbids; drop one of the two"
+        );
+    }
 
     // The HTTP listener is bound here and handed to the task, rather than
     // probed and rebound later, so nothing can take the port in between.
