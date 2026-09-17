@@ -29,7 +29,7 @@ tsize, windowsize), netascii mode, and an optional HTTP file server.
 - **Ephemeral transfer sockets** -- each transfer gets its own OS-assigned port, keeping the main listener free
 - **Request deduplication** -- duplicate requests from the same peer are silently dropped while a transfer is already in progress
 - **Overwrite protection** -- WRQ for existing files can be rejected with `--allow-overwrite false` (returns error code 6)
-- **Access control** -- `--disable-read` or `--disable-write` to restrict what operations clients may perform
+- **Access control** -- `--disable-read` or `--disable-write` to restrict what operations clients may perform (`--disable-read` refuses to run alongside `--http-port`, which would hand out the same files anyway)
 - **Configurable retransmission** -- `--timeout` (ms) and `--max-retries` to tune behaviour for unstable networks
 - **HTTP file server** -- optional HTTP server for browser-based directory browsing and file downloads (`--http-port`)
 - **TUI dashboard** -- real-time view of server status, shared files tree, active transfers with progress bars, and timestamped scrollable logs
