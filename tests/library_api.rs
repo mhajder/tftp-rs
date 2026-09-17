@@ -745,13 +745,33 @@ async fn an_upload_past_the_size_limit_is_cut_off() {
     // Code 3, "disk full or allocation exceeded".
     assert_eq!(error_code, 3);
 
-    // Nothing oversized is left behind, staging file included.
-    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-        .expect("served directory")
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .collect();
-    assert!(leftovers.is_empty(), "unexpected leftovers: {leftovers:?}");
+    // Nothing oversized is left behind, staging file included. The error
+    // reaches the client before the handler returns, and the staging file is
+    // removed after that, so this waits for the cleanup rather than assuming
+    // it has already happened by the time the error arrives.
+    let leftovers = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let names: Vec<_> = std::fs::read_dir(dir.path())
+                .expect("served directory")
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            if names.is_empty() {
+                return names;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        leftovers.is_ok(),
+        "the staging file was never cleaned up: {:?}",
+        std::fs::read_dir(dir.path())
+            .expect("served directory")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+    );
 
     shutdown_tx.send(true).expect("shutdown signal");
     server.await.expect("server task").expect("server result");

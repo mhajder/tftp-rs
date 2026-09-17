@@ -1,0 +1,70 @@
+fail_fast: false
+minimum_prek_version: "0.4.0"
+default_install_hook_types: [ pre-commit ]
+exclude: |
+  (?x)^(
+    Cargo.lock
+    | CHANGELOG.md
+  )
+
+repos:
+  - repo: meta
+    hooks:
+      - id: identity
+        name: Print checked files
+        description: Print input to the static check hooks for troubleshooting
+
+  - repo: builtin
+    hooks:
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: end-of-file-fixer
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [ --maxkb=100 ]
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [ rust ]
+        pass_filenames: false
+        always_run: true
+
+      - id: cargo-check
+        name: cargo check
+        entry: cargo check --all-targets
+        language: system
+        types: [ rust ]
+        pass_filenames: false
+        always_run: true
+
+      - id: cargo-check-no-default-features
+        name: cargo check (no default features)
+        entry: cargo check --lib --no-default-features
+        language: system
+        types: [ rust ]
+        pass_filenames: false
+        always_run: true
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets -- -D warnings
+        language: system
+        types: [ rust ]
+        pass_filenames: false
+        always_run: true
+
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test
+        language: system
+        types: [ rust ]
+        pass_filenames: false
+        always_run: true
