@@ -1239,6 +1239,11 @@ async fn handle_rrq(
     let mut recv_buf = vec![0u8; MAX_PACKET];
     let max_retries = config.max_retries;
 
+    // Copies of the OACK sent after the first. A client may answer each with
+    // ACK 0, and a windowed download takes a repeated ACK 0 for a request to
+    // resend its first window, so it needs to know how many to expect.
+    let mut oack_copies = 0u32;
+
     // Send OACK if we have negotiated options, then wait for ACK 0.
     if !oack_options.is_empty() {
         let oack_pkt = Packet::OACK {
@@ -1247,42 +1252,33 @@ async fn handle_rrq(
         let oack_bytes = oack_pkt.to_bytes();
 
         let mut retries = 0u32;
+        send_resilient(&sock, &oack_bytes).await?;
+        let mut deadline = tokio::time::Instant::now() + timeout_dur;
         loop {
-            send_resilient(&sock, &oack_bytes).await?;
-            match timeout(timeout_dur, sock.recv(&mut recv_buf)).await {
-                Ok(Ok(n)) => {
-                    // A datagram the parser rejects is not a reason to abandon
-                    // a transfer; it is a stray packet like any other.
-                    let Ok(ack) = Packet::from_bytes(&recv_buf[..n]) else {
-                        retries += 1;
-                        if retries > max_retries {
-                            return Err(anyhow!("timeout waiting for OACK acknowledgment"));
-                        }
-                        continue;
-                    };
-                    match ack {
-                        Packet::ACK { block_num: 0 } => break,
-                        Packet::ERROR { code, msg } => {
-                            return Err(anyhow!("client error {code}: {msg}"));
-                        }
-                        // Anything else leaves us no further forward, so it
-                        // counts against the retry budget exactly as silence
-                        // does. Otherwise a client that keeps answering with
-                        // the wrong packet keeps the server resending forever.
-                        _ => {
-                            retries += 1;
-                            if retries > max_retries {
-                                return Err(anyhow!("timeout waiting for OACK acknowledgment"));
-                            }
-                        }
+            match timeout_at(deadline, sock.recv(&mut recv_buf)).await {
+                Ok(Ok(n)) => match Packet::from_bytes(&recv_buf[..n]) {
+                    Ok(Packet::ACK { block_num: 0 }) => break,
+                    Ok(Packet::ERROR { code, msg }) => {
+                        return Err(anyhow!("client error {code}: {msg}"));
                     }
-                }
+                    // Only a timeout resends, as everywhere else in a
+                    // download. Answering stray packets with the OACK would
+                    // let them buy copies of it, and every copy is one more
+                    // ACK 0 the first window must expect, so enough strays
+                    // would have it ignore a real request to resend. They do
+                    // not move the deadline, so they cannot hold the
+                    // transfer open either.
+                    _ => {}
+                },
                 Ok(Err(e)) => return Err(e.into()),
                 Err(_) => {
                     retries += 1;
                     if retries > max_retries {
                         return Err(anyhow!("timeout waiting for OACK acknowledgment"));
                     }
+                    send_resilient(&sock, &oack_bytes).await?;
+                    oack_copies += 1;
+                    deadline = tokio::time::Instant::now() + timeout_dur;
                 }
             }
         }
@@ -1317,6 +1313,10 @@ async fn handle_rrq(
     if windowsize > 1 {
         // Read and send `windowsize` DATA blocks, then wait for ACK.
         // The ACK may acknowledge any block in the window.
+        //
+        // Late ACKs for the block before the current window that are still
+        // expected, one per extra copy of the window that came before it.
+        let mut stale_acks = oack_copies;
         loop {
             let mut window: Vec<(u16, Vec<u8>)> = Vec::with_capacity(windowsize as usize);
             let mut last_block = false;
@@ -1336,99 +1336,89 @@ async fn handle_rrq(
 
             let window_end = window.last().map(|(bn, _)| *bn).unwrap_or(block_num);
 
-            // Send all blocks in the window.
             let mut retries = 0u32;
             // Resends asked for by the client rather than by a timeout. Kept
             // apart from `retries` so that a lossy link still gets the full
             // budget for both, but bounded all the same.
             let mut recoveries = 0u32;
-            loop {
-                for (bn, payload) in &window {
-                    send_resilient(&sock, &encode_data(*bn, payload)).await?;
-                }
+            // Copies of this window sent after the first. A client answers
+            // every copy it receives, so each may draw one more ACK after the
+            // window has moved on.
+            let mut extra_copies = 0u32;
 
-                // Wait for ACK for any block in the window.
-                match timeout(timeout_dur, sock.recv(&mut recv_buf)).await {
-                    Ok(Ok(n)) => {
-                        let Ok(ack) = Packet::from_bytes(&recv_buf[..n]) else {
-                            retries += 1;
-                            if retries > max_retries {
+            send_window(&sock, &window).await?;
+            // Only a timeout or a request from the client resends, and only
+            // progress moves the deadline, so a stream of stray packets can
+            // neither multiply the traffic nor hold the transfer open.
+            let mut deadline = tokio::time::Instant::now() + timeout_dur;
+            loop {
+                match timeout_at(deadline, sock.recv(&mut recv_buf)).await {
+                    Ok(Ok(n)) => match Packet::from_bytes(&recv_buf[..n]) {
+                        Ok(Packet::ACK { block_num: bn }) if bn == window_end => {
+                            // Full window acknowledged.
+                            let total_payload: u64 =
+                                window.iter().map(|(_, p)| p.len() as u64).sum();
+                            transferred += total_payload;
+                            stale_acks = extra_copies;
+                            break;
+                        }
+                        Ok(Packet::ACK { block_num: bn }) if is_in_window(bn, &window) => {
+                            // Partial ACK — remove acknowledged blocks and resend rest.
+                            let mut acked_bytes: u64 = 0;
+                            while !window.is_empty() && window[0].0 != bn.wrapping_add(1) {
+                                let (_, p) = window.remove(0);
+                                acked_bytes += p.len() as u64;
+                            }
+                            transferred += acked_bytes;
+                            // The window shrank, so the client did move
+                            // forward and both budgets start over.
+                            retries = 0;
+                            recoveries = 0;
+                            stale_acks = extra_copies;
+                            extra_copies = 0;
+                            send_window(&sock, &window).await?;
+                            deadline = tokio::time::Instant::now() + timeout_dur;
+                        }
+                        // Re-acknowledging the block before this window is how
+                        // an RFC 7440 client reports that the window's first
+                        // block went missing. It is also what a late ACK looks
+                        // like: once a window has been sent twice, the client
+                        // answers both copies, and the second answer arrives
+                        // after the window has moved on. Taking that one as a
+                        // request too would send every window after it twice,
+                        // the Sorcerer's Apprentice bug again. So the ACKs the
+                        // previous window's extra copies account for are
+                        // ignored, and only the rest resend.
+                        //
+                        // A real request still has to be bounded: nothing in
+                        // the window has been acknowledged, so a client
+                        // repeating that one number would otherwise have every
+                        // block sent back to it for ever, a whole window of
+                        // traffic for each four-byte packet.
+                        Ok(Packet::ACK { block_num: bn })
+                            if Some(bn) == window.first().map(|(b, _)| b.wrapping_sub(1)) =>
+                        {
+                            if stale_acks > 0 {
+                                stale_acks -= 1;
+                                continue;
+                            }
+                            recoveries += 1;
+                            if recoveries > max_retries {
                                 return Err(anyhow!(
-                                    "no usable acknowledgment after {max_retries} attempts"
+                                    "window ending at block {window_end} was re-requested {max_retries} times without progress"
                                 ));
                             }
-                            continue;
-                        };
-                        match ack {
-                            Packet::ACK { block_num: bn } => {
-                                // Check if this ACK is for the end of our window.
-                                if bn == window_end {
-                                    // Full window acknowledged.
-                                    let total_payload: u64 =
-                                        window.iter().map(|(_, p)| p.len() as u64).sum();
-                                    transferred += total_payload;
-                                    break;
-                                } else if is_in_window(bn, &window) {
-                                    // Partial ACK — remove acknowledged blocks and resend rest.
-                                    let mut acked_bytes: u64 = 0;
-                                    while !window.is_empty() && window[0].0 != bn.wrapping_add(1) {
-                                        let (_, p) = window.remove(0);
-                                        acked_bytes += p.len() as u64;
-                                        if window.is_empty() {
-                                            break;
-                                        }
-                                    }
-                                    transferred += acked_bytes;
-                                    // The window shrank, so the client did
-                                    // move forward and both budgets start over.
-                                    retries = 0;
-                                    recoveries = 0;
-                                    continue;
-                                }
-                                // Re-acknowledging the block before this
-                                // window is how an RFC 7440 client reports
-                                // that the window's first block went missing.
-                                // Resending the window is the correct answer,
-                                // so it draws on its own budget rather than the
-                                // one a stray packet spends. It still has to be
-                                // bounded: nothing in the window has been
-                                // acknowledged, so a client repeating that one
-                                // number would otherwise have every block sent
-                                // back to it for ever, a whole window of
-                                // traffic for each four-byte packet.
-                                let previous_window_end =
-                                    window.first().map(|(bn, _)| bn.wrapping_sub(1));
-                                if Some(bn) == previous_window_end {
-                                    recoveries += 1;
-                                    if recoveries > max_retries {
-                                        return Err(anyhow!(
-                                            "window ending at block {window_end} was re-requested {max_retries} times without progress"
-                                        ));
-                                    }
-                                } else {
-                                    // Any other block is outside the
-                                    // conversation entirely.
-                                    retries += 1;
-                                    if retries > max_retries {
-                                        return Err(anyhow!(
-                                            "no usable acknowledgment after {max_retries} attempts"
-                                        ));
-                                    }
-                                }
-                            }
-                            Packet::ERROR { code, msg } => {
-                                return Err(anyhow!("client error {code}: {msg}"));
-                            }
-                            _ => {
-                                retries += 1;
-                                if retries > max_retries {
-                                    return Err(anyhow!(
-                                        "no usable acknowledgment after {max_retries} attempts"
-                                    ));
-                                }
-                            }
+                            send_window(&sock, &window).await?;
+                            extra_copies += 1;
+                            deadline = tokio::time::Instant::now() + timeout_dur;
                         }
-                    }
+                        Ok(Packet::ERROR { code, msg }) => {
+                            return Err(anyhow!("client error {code}: {msg}"));
+                        }
+                        // Any other block is outside the conversation
+                        // entirely, and is ignored without moving the deadline.
+                        _ => {}
+                    },
                     Ok(Err(e)) => return Err(e.into()),
                     Err(_) => {
                         retries += 1;
@@ -1436,7 +1426,9 @@ async fn handle_rrq(
                             return Err(anyhow!("timeout after {max_retries} retries"));
                         }
                         // Resend the entire window.
-                        continue;
+                        send_window(&sock, &window).await?;
+                        extra_copies += 1;
+                        deadline = tokio::time::Instant::now() + timeout_dur;
                     }
                 }
             }
@@ -1575,6 +1567,14 @@ async fn fill_buffer(file: &mut tokio::fs::File, buf: &mut [u8]) -> Result<usize
 /// Check if an encoder has pending overflow data.
 fn has_encoder_overflow(encoder: &Option<NetasciiEncoder>) -> bool {
     encoder.as_ref().is_some_and(|e| e.has_overflow())
+}
+
+/// Send every block still in a download window.
+async fn send_window(sock: &UdpSocket, window: &[(u16, Vec<u8>)]) -> Result<()> {
+    for (bn, payload) in window {
+        send_resilient(sock, &encode_data(*bn, payload)).await?;
+    }
+    Ok(())
 }
 
 /// Whether an upload block lies past the expected one, within one window: a
