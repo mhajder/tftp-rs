@@ -1546,6 +1546,18 @@ fn has_encoder_overflow(encoder: &Option<NetasciiEncoder>) -> bool {
     encoder.as_ref().is_some_and(|e| e.has_overflow())
 }
 
+/// Whether an upload block lies past the expected one, within one window: a
+/// block from beyond one that went missing.
+///
+/// Block numbers wrap, so being ahead only means anything within half the
+/// number space. Further than that, a block is as likely an old one, behind
+/// by the rest of the way round, and a window of more than 32767 blocks would
+/// otherwise have most already-stored blocks taken for news of a gap.
+fn is_beyond_gap(block_num: u16, expected_block: u16, windowsize: u16) -> bool {
+    let ahead = block_num.wrapping_sub(expected_block);
+    (1..=windowsize.min(i16::MAX as u16)).contains(&ahead)
+}
+
 /// Check if a block number is within the current window.
 fn is_in_window(bn: u16, window: &[(u16, Vec<u8>)]) -> bool {
     window.iter().any(|(b, _)| *b == bn)
@@ -1767,14 +1779,19 @@ async fn handle_wrq(
 
     if windowsize > 1 {
         // --- Windowed WRQ ---
+        // Blocks from beyond a gap since the last block that arrived in order.
+        let mut beyond_gap = 0u32;
         loop {
             let mut window_data: Vec<(u16, Vec<u8>)> = Vec::new();
             let mut last_block = false;
             let mut retries = 0u32;
+            // Only data that moves the transfer on postpones the timeout, so
+            // a stream of stray or duplicate packets cannot hold it open.
+            let mut deadline = tokio::time::Instant::now() + timeout_dur;
 
             // Receive up to `windowsize` DATA blocks.
             loop {
-                match timeout(timeout_dur, sock.recv(&mut recv_buf)).await {
+                match timeout_at(deadline, sock.recv(&mut recv_buf)).await {
                     Ok(Ok(n)) => {
                         let Ok(pkt) = Packet::from_bytes(&recv_buf[..n]) else {
                             retries += 1;
@@ -1793,6 +1810,8 @@ async fn handle_wrq(
                                 // Forward progress: the peer earns a fresh
                                 // budget for the rest of this window.
                                 retries = 0;
+                                beyond_gap = 0;
+                                deadline = tokio::time::Instant::now() + timeout_dur;
                                 expected_block = expected_block.wrapping_add(1);
                                 if is_last {
                                     last_block = true;
@@ -1802,22 +1821,45 @@ async fn handle_wrq(
                                     break;
                                 }
                             }
+                            // A block from beyond one that went missing. The
+                            // answer is an ACK for the last block stored in
+                            // order, which tells the client where to start
+                            // again without waiting for the timeout.
+                            //
+                            // They arrive a burst at a time, so one ACK
+                            // answers a window's worth. Answering each would
+                            // have the client restart its window once per
+                            // packet.
                             Packet::DATA { block_num, .. }
-                                if block_num == expected_block.wrapping_sub(1)
-                                    && window_data.is_empty() =>
+                                if is_beyond_gap(block_num, expected_block, windowsize) =>
                             {
-                                // Duplicate of previous block — re-ACK, but
-                                // count it: a client replaying one block must
-                                // not hold the transfer open indefinitely.
-                                retries += 1;
-                                if retries > max_retries {
-                                    return Err(anyhow!(
-                                        "no new data after {max_retries} duplicate blocks"
-                                    ));
+                                if !window_data.is_empty() {
+                                    // Store what arrived in order. Its ACK is
+                                    // the answer, so the rest of this burst
+                                    // starts from one already sent.
+                                    beyond_gap = 1;
+                                    break;
                                 }
-                                let ack = Packet::ACK { block_num };
-                                send_resilient(&sock, &ack.to_bytes()).await?;
+                                beyond_gap += 1;
+                                if beyond_gap % u32::from(windowsize) == 1 {
+                                    send_resilient(
+                                        &sock,
+                                        &reacknowledge(expected_block, received_any),
+                                    )
+                                    .await?;
+                                }
                             }
+                            // Anything else is a block already stored: a
+                            // duplicate made by the network, or the client
+                            // resending a window whose ACK it never saw. It is
+                            // ignored. Answering duplicates sends the client
+                            // back to blocks it has already sent again, and
+                            // the copies that produces are duplicates in
+                            // turn, so one stray packet would double the
+                            // traffic for the rest of the upload. A client
+                            // that really missed the ACK gets it again when
+                            // the deadline passes, which nothing here moves.
+                            Packet::DATA { .. } => {}
                             Packet::ERROR { code, msg } => {
                                 return Err(anyhow!("client error {code}: {msg}"));
                             }
@@ -1845,6 +1887,7 @@ async fn handle_wrq(
                             ));
                         }
                         send_resilient(&sock, &reacknowledge(expected_block, received_any)).await?;
+                        deadline = tokio::time::Instant::now() + timeout_dur;
                     }
                 }
             }
@@ -2287,6 +2330,20 @@ mod tests {
         assert_eq!(single_line("clear\u{1b}[2J"), "clear\\u{001b}[2J");
         // Text outside ASCII is not a control character and is left alone.
         assert_eq!(single_line("firmware-é.bin"), "firmware-é.bin");
+    }
+
+    #[test]
+    fn a_gap_is_only_ever_less_than_half_way_round() {
+        // Within the window, across the wrap too.
+        assert!(is_beyond_gap(12, 10, 8));
+        assert!(is_beyond_gap(2, 65534, 8));
+        assert!(!is_beyond_gap(10, 10, 8));
+        assert!(!is_beyond_gap(19, 10, 8));
+        // A block already stored is behind, never beyond a gap.
+        assert!(!is_beyond_gap(9, 10, 8));
+        // With a huge window, a block 1000 behind is still behind.
+        assert!(!is_beyond_gap(9_000, 10_000, u16::MAX));
+        assert!(is_beyond_gap(11_000, 10_000, u16::MAX));
     }
 
     #[test]

@@ -1702,6 +1702,187 @@ async fn expect_ack(client: &UdpSocket, block: u16) {
     }
 }
 
+/// A windowed upload of eight-byte blocks, with a server that gives up after
+/// three retries.
+async fn start_windowed_upload(
+    dir: &std::path::Path,
+    filename: &str,
+) -> (
+    UdpSocket,
+    SocketAddr,
+    watch::Sender<bool>,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let (listener_address, shutdown_tx, server, _events) = start(
+        dir,
+        ServerConfig {
+            max_window_size: 8,
+            max_retries: 3,
+            ..ServerConfig::default()
+        },
+    )
+    .await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    client
+        .send_to(
+            &wrq_with_options(filename, &[("blksize", "8"), ("windowsize", "8")]),
+            listener_address,
+        )
+        .await
+        .expect("WRQ");
+    let mut buffer = [0_u8; 616];
+    let (_, from) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("OACK timeout")
+        .expect("datagram");
+    assert_eq!(&buffer[..2], &[0, 6]);
+    (client, from, shutdown_tx, server)
+}
+
+#[tokio::test]
+async fn a_resent_window_does_not_use_up_the_retries() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let (client, from, shutdown_tx, server) = start_windowed_upload(dir.path(), "resent.bin").await;
+
+    for block in 1..=8 {
+        send_data(&client, from, block, b"abcdefgh").await;
+    }
+    expect_ack(&client, 8).await;
+
+    // The client never saw that ACK and sends the whole window again: eight
+    // blocks the server already has, more than its three retries.
+    for block in 1..=8 {
+        send_data(&client, from, block, b"abcdefgh").await;
+    }
+    send_data(&client, from, 9, b"end").await;
+    expect_ack(&client, 9).await;
+
+    let mut expected = b"abcdefgh".repeat(8);
+    expected.extend_from_slice(b"end");
+    assert_eq!(
+        tokio::fs::read(dir.path().join("resent.bin"))
+            .await
+            .expect("upload"),
+        expected
+    );
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
+
+#[tokio::test]
+async fn a_lost_block_in_a_window_is_reported_without_waiting_for_a_timeout() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let (client, from, shutdown_tx, server) = start_windowed_upload(dir.path(), "gap.bin").await;
+
+    for block in 1..=8 {
+        send_data(&client, from, block, b"abcdefgh").await;
+    }
+    expect_ack(&client, 8).await;
+
+    // Block 9 is lost. What follows it cannot be stored, and the server says
+    // where to restart well before its 500 ms timeout would.
+    for block in 10..=16 {
+        send_data(&client, from, block, b"abcdefgh").await;
+    }
+    let mut buffer = [0_u8; 616];
+    tokio::time::timeout(Duration::from_millis(250), client.recv_from(&mut buffer))
+        .await
+        .expect("the gap went unreported")
+        .expect("datagram");
+    assert_eq!(&buffer[..4], &[0, 4, 0, 8]);
+
+    for block in 9..=16 {
+        send_data(&client, from, block, b"abcdefgh").await;
+    }
+    expect_ack(&client, 16).await;
+    send_data(&client, from, 17, b"").await;
+    expect_ack(&client, 17).await;
+
+    assert_eq!(
+        tokio::fs::read(dir.path().join("gap.bin"))
+            .await
+            .expect("upload"),
+        b"abcdefgh".repeat(16)
+    );
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
+
+#[tokio::test]
+async fn a_duplicate_block_does_not_cut_a_window_short() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let (client, from, shutdown_tx, server) = start_windowed_upload(dir.path(), "dup.bin").await;
+
+    for block in 1..=8 {
+        send_data(&client, from, block, b"abcdefgh").await;
+    }
+    expect_ack(&client, 8).await;
+
+    // A copy of a block stored long ago turns up mid-window. Acknowledging
+    // early would send the client back to blocks it has already sent.
+    send_data(&client, from, 9, b"abcdefgh").await;
+    send_data(&client, from, 10, b"abcdefgh").await;
+    send_data(&client, from, 3, b"abcdefgh").await;
+    for block in 11..=16 {
+        send_data(&client, from, block, b"abcdefgh").await;
+    }
+    let mut buffer = [0_u8; 616];
+    tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("no ACK")
+        .expect("datagram");
+    assert_eq!(&buffer[..4], &[0, 4, 0, 16], "the window was cut short");
+
+    send_data(&client, from, 17, b"").await;
+    expect_ack(&client, 17).await;
+    assert_eq!(
+        tokio::fs::read(dir.path().join("dup.bin"))
+            .await
+            .expect("upload"),
+        b"abcdefgh".repeat(16)
+    );
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
+
+#[tokio::test]
+async fn resent_blocks_cannot_put_off_the_repeated_ack() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let (client, from, shutdown_tx, server) = start_windowed_upload(dir.path(), "late.bin").await;
+
+    for block in 1..=8 {
+        send_data(&client, from, block, b"abcdefgh").await;
+    }
+    expect_ack(&client, 8).await;
+
+    // The client never saw ACK 8 and keeps resending its window, faster than
+    // the server's 500 ms timeout. The ACK still has to come round again.
+    let mut buffer = [0_u8; 616];
+    let repeated = tokio::time::timeout(Duration::from_millis(1500), async {
+        loop {
+            send_data(&client, from, 1, b"abcdefgh").await;
+            if let Ok(Ok(_)) =
+                tokio::time::timeout(Duration::from_millis(100), client.recv_from(&mut buffer))
+                    .await
+            {
+                return u16::from_be_bytes([buffer[2], buffer[3]]);
+            }
+        }
+    })
+    .await
+    .expect("the ACK was never repeated");
+    assert_eq!(repeated, 8);
+
+    send_data(&client, from, 9, b"").await;
+    expect_ack(&client, 9).await;
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
+
 #[tokio::test]
 async fn a_promoted_upload_leaves_its_staging_name_alone() {
     let dir = tempfile::tempdir().expect("temporary directory");
