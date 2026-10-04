@@ -87,17 +87,19 @@ async fn serve_path(
         return (StatusCode::NOT_FOUND, "Not found").into_response();
     };
 
-    // A TFTP upload still in progress: what is there now is not the file.
-    if resolved
-        .file_name()
-        .is_some_and(|name| is_upload_staging_name(&name.to_string_lossy()))
-    {
-        return (StatusCode::NOT_FOUND, "Not found").into_response();
-    }
-
     let Ok(metadata) = tokio::fs::metadata(&resolved).await else {
         return (StatusCode::NOT_FOUND, "Not found").into_response();
     };
+
+    // A TFTP upload still in progress: what is there now is not the file. A
+    // directory by such a name is only a directory, and the listing shows it.
+    if metadata.is_file()
+        && resolved
+            .file_name()
+            .is_some_and(|name| is_upload_staging_name(&name.to_string_lossy()))
+    {
+        return (StatusCode::NOT_FOUND, "Not found").into_response();
+    }
 
     if metadata.is_dir() {
         listing_response(resolved, uri_path.clone()).await
@@ -431,5 +433,20 @@ mod tests {
 
         let response = get(dir.path(), "/fw.bin.7.part").await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_directory_named_like_a_staging_file_can_be_opened() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        std::fs::create_dir(dir.path().join("logs.1.part")).expect("directory");
+
+        let listing = get(dir.path(), "/").await;
+        let html = axum::body::to_bytes(listing.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(String::from_utf8_lossy(&html).contains("logs.1.part/"));
+
+        let response = get(dir.path(), "/logs.1.part/").await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
