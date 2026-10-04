@@ -32,7 +32,7 @@ tsize, windowsize), netascii mode, and an optional HTTP file server.
 - **Access control** -- `--disable-read` or `--disable-write` to restrict what operations clients may perform (`--disable-read` refuses to run alongside `--http-port`, which would hand out the same files anyway)
 - **Configurable retransmission** -- `--timeout` (ms) and `--max-retries` to tune behaviour for unstable networks
 - **Resource limits** -- `--max-concurrent-transfers` (default 256) bounds the sockets and open files unanswered requests can tie up; `--max-upload-size` caps what a single upload may write (off by default)
-- **HTTP file server** -- optional HTTP server for browser-based directory browsing and file downloads (`--http-port`)
+- **HTTP file server** -- optional HTTP server for browser-based directory browsing and file downloads (`--http-port`); uploads still in progress are neither listed nor served
 - **TUI dashboard** -- real-time view of server status, shared files tree, active transfers with progress bars, and timestamped scrollable logs
 - **Interface discovery** -- with the default wildcard bind, displays the host's non-loopback IPv4 addresses in the header (auto-refreshes every 10 seconds); adding `--interface` narrows that to the named device's IPv4 addresses, loopback included, because those are the ones the server answers on; with an explicit `--bind` it shows the one address in use
 - **Scrollable panels** -- Tab to cycle focus between Shared Files, Active Transfers, and Logs panels; Up/Down to scroll

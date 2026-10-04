@@ -1028,6 +1028,31 @@ fn file_error_reply(error: &std::io::Error) -> (u16, &'static str) {
     }
 }
 
+/// Whether `name` is the staging file of an upload still in progress, as named
+/// by [`part_path`]: the target name, a transfer id, and `.part`.
+///
+/// A staging file holds a partial upload, or one that is about to be
+/// discarded. Anything else that serves the same directory should not hand it
+/// out as a file.
+///
+/// The match ignores ASCII case, and trailing dots and spaces. macOS and
+/// Windows, and FAT everywhere, ignore case in a name, and Windows drops
+/// trailing dots and spaces, so `fw.bin.7.PART` and `fw.bin.7.part.` name the
+/// same file as `fw.bin.7.part` there.
+pub fn is_upload_staging_name(name: &str) -> bool {
+    let name = name.trim_end_matches(['.', ' ']);
+    let suffix = name.len().saturating_sub(".part".len());
+    if !name.as_bytes()[suffix..].eq_ignore_ascii_case(b".part") {
+        return false;
+    }
+    // The suffix is ASCII, so this cuts on a character boundary.
+    let rest = &name[..suffix];
+    let Some((target, id)) = rest.rsplit_once('.') else {
+        return false;
+    };
+    !target.is_empty() && !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// A request that failed before the transfer started, carrying the TFTP error
 /// code the client should be told about.
 ///
@@ -2330,6 +2355,25 @@ mod tests {
         assert_eq!(single_line("clear\u{1b}[2J"), "clear\\u{001b}[2J");
         // Text outside ASCII is not a control character and is left alone.
         assert_eq!(single_line("firmware-é.bin"), "firmware-é.bin");
+    }
+
+    #[test]
+    fn staging_names_are_recognised() {
+        let staged = part_path(Path::new("fw.bin"), 17);
+        assert!(is_upload_staging_name(staged.to_str().unwrap()));
+        assert!(is_upload_staging_name("x.1.part"));
+        assert!(!is_upload_staging_name("notes.part"));
+        assert!(!is_upload_staging_name(".1.part"));
+        assert!(!is_upload_staging_name("fw.v2.part"));
+        assert!(!is_upload_staging_name("fw.1.part.bin"));
+        // What a case-insensitive filesystem, or Windows, takes for the same
+        // name.
+        assert!(is_upload_staging_name("fw.bin.2.PART"));
+        assert!(is_upload_staging_name("fw.bin.2.Part"));
+        assert!(is_upload_staging_name("fw.bin.2.part."));
+        assert!(is_upload_staging_name("fw.bin.2.part . "));
+        assert!(!is_upload_staging_name("part"));
+        assert!(!is_upload_staging_name("é.part"));
     }
 
     #[test]
