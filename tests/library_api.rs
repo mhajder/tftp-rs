@@ -1811,6 +1811,39 @@ async fn a_lost_block_in_a_window_is_reported_without_waiting_for_a_timeout() {
 }
 
 #[tokio::test]
+async fn settings_no_transfer_could_use_are_refused() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    for config in [
+        ServerConfig {
+            timeout_ms: 0,
+            ..ServerConfig::default()
+        },
+        ServerConfig {
+            max_block_size: 4,
+            ..ServerConfig::default()
+        },
+    ] {
+        assert!(config.validate().is_err());
+        let (events, _event_rx) = mpsc::unbounded_channel();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run(
+                "127.0.0.1:0".parse().expect("address"),
+                dir.path().to_path_buf(),
+                events,
+                shutdown_rx,
+                config,
+            ),
+        )
+        .await
+        .expect("run must return at once");
+        assert!(result.is_err());
+    }
+    assert!(ServerConfig::default().validate().is_ok());
+}
+
+#[tokio::test]
 async fn a_duplicate_block_does_not_cut_a_window_short() {
     let dir = tempfile::tempdir().expect("temporary directory");
     let (client, from, shutdown_tx, server) = start_windowed_upload(dir.path(), "dup.bin").await;

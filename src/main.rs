@@ -58,7 +58,8 @@ struct Cli {
     timeout: u64,
 
     /// Maximum block size (blksize) to negotiate with clients. Useful when
-    /// accessing clients through a VPN with limited MTU. 0 = OS-detected max.
+    /// accessing clients through a VPN with limited MTU. 0 = OS-detected max,
+    /// otherwise at least 8.
     #[arg(long, default_value_t = 0)]
     max_block_size: usize,
 
@@ -107,10 +108,35 @@ struct Cli {
     disable_write: bool,
 }
 
+/// The server settings the command line asks for.
+fn server_config(cli: &Cli) -> ServerConfig {
+    ServerConfig {
+        timeout_ms: cli.timeout,
+        max_block_size: cli.max_block_size,
+        max_window_size: cli.max_window_size,
+        allow_overwrite: cli.allow_overwrite,
+        max_retries: cli.max_retries,
+        enable_read: !cli.disable_read,
+        enable_write: !cli.disable_write,
+        max_concurrent_transfers: cli.max_concurrent_transfers,
+        max_upload_bytes: cli.max_upload_size,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let tftp_addr = SocketAddr::new(cli.bind, cli.port);
+
+    // Build server configuration from CLI args. The server would refuse
+    // settings no transfer could use, but only once the dashboard has the
+    // terminal, where the reason ends up as one log line among others. Done
+    // first, so a bad value is reported before a log file is created or a
+    // port is bound.
+    let server_config = server_config(&cli);
+    server_config
+        .validate()
+        .context("invalid --timeout or --max-block-size")?;
 
     // Fail before the dashboard takes over the terminal. A server error after
     // that point only reaches the user as a log line in the TUI.
@@ -166,19 +192,6 @@ async fn main() -> Result<()> {
 
     // Clone shutdown receiver for HTTP server before TFTP server consumes it.
     let http_shutdown_rx = shutdown_rx.clone();
-
-    // Build server configuration from CLI args.
-    let server_config = ServerConfig {
-        timeout_ms: cli.timeout,
-        max_block_size: cli.max_block_size,
-        max_window_size: cli.max_window_size,
-        allow_overwrite: cli.allow_overwrite,
-        max_retries: cli.max_retries,
-        enable_read: !cli.disable_read,
-        enable_write: !cli.disable_write,
-        max_concurrent_transfers: cli.max_concurrent_transfers,
-        max_upload_bytes: cli.max_upload_size,
-    };
 
     // Spawn the TFTP server in the background.
     let server_handle = {
@@ -351,6 +364,33 @@ fn handle_server_event(app: &mut App, ev: ServerEvent) {
         ServerEvent::TransferFailed { id, error } => {
             app.transfers.retain(|t| t.id != id);
             app.push_log(format!("Transfer #{id} failed: {error}"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_for(args: &[&str]) -> ServerConfig {
+        let mut argv = vec!["tftp-rs"];
+        argv.extend_from_slice(args);
+        server_config(&Cli::try_parse_from(argv).expect("arguments"))
+    }
+
+    #[test]
+    fn a_zero_timeout_is_refused() {
+        assert!(config_for(&["--timeout", "0"]).validate().is_err());
+        assert!(config_for(&["--timeout", "1"]).validate().is_ok());
+    }
+
+    #[test]
+    fn a_block_size_below_eight_is_refused() {
+        for size in ["1", "4", "7"] {
+            assert!(config_for(&["--max-block-size", size]).validate().is_err());
+        }
+        for size in ["0", "8", "1428"] {
+            assert!(config_for(&["--max-block-size", size]).validate().is_ok());
         }
     }
 }

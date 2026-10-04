@@ -16,8 +16,8 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout, timeout_at};
 
 use crate::tftp_protocol::{
-    BLOCK_SIZE, DEFAULT_WINDOWSIZE, MAX_BLKSIZE, MAX_TIMEOUT, MIN_TIMEOUT, NetasciiDecoder,
-    NetasciiEncoder, Packet,
+    BLOCK_SIZE, DEFAULT_WINDOWSIZE, MAX_BLKSIZE, MAX_TIMEOUT, MIN_BLKSIZE, MIN_TIMEOUT,
+    NetasciiDecoder, NetasciiEncoder, Packet,
 };
 
 /// Maximum UDP datagram size we ever expect (4-byte header + max blksize).
@@ -107,6 +107,27 @@ impl Default for ServerConfig {
             max_concurrent_transfers: DEFAULT_MAX_CONCURRENT_TRANSFERS,
             max_upload_bytes: 0,
         }
+    }
+}
+
+impl ServerConfig {
+    /// Check the settings for values no transfer could work with.
+    ///
+    /// [`run`] and [`run_on_interface`] call this before binding anything.
+    /// A `timeout_ms` of 0 makes every wait for a reply expire at once, so a
+    /// transfer spends all its retries in microseconds and fails on any real
+    /// network. RFC 2348 puts the smallest block size at 8 bytes.
+    pub fn validate(&self) -> Result<()> {
+        if self.timeout_ms == 0 {
+            return Err(anyhow!("the reply timeout must be at least 1 ms"));
+        }
+        if self.max_block_size != 0 && self.max_block_size < MIN_BLKSIZE {
+            return Err(anyhow!(
+                "the maximum block size must be 0 (no limit) or at least {MIN_BLKSIZE} bytes, not {}",
+                self.max_block_size
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -568,7 +589,7 @@ fn negotiate_options(
     // RFC 2348: blksize option.
     if let Some(val) = client_options.get("blksize")
         && let Ok(requested) = val.parse::<usize>()
-        && (8..=MAX_BLKSIZE).contains(&requested)
+        && (MIN_BLKSIZE..=MAX_BLKSIZE).contains(&requested)
     {
         blksize = requested.min(effective_max_blksize);
         acked.insert("blksize".to_string(), blksize.to_string());
@@ -715,6 +736,7 @@ async fn run_inner(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     config: ServerConfig,
 ) -> Result<()> {
+    config.validate()?;
     let sock = bind_udp_socket(bind_addr, interface.as_ref(), None)?;
     let local_addr = sock.local_addr()?;
     let listener_description = match interface.as_ref() {

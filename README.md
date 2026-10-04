@@ -107,8 +107,8 @@ Options:
   -d, --dir <DIR>                    Directory to serve / receive files [default: .]
   -l, --log-file <LOG_FILE>          Optional file path to write logs to
       --http-port <PORT>             Enable HTTP file server on the specified port
-  -t, --timeout <MS>                 Reply timeout in milliseconds [default: 500]
-      --max-block-size <BYTES>       Max negotiable blksize (0 = OS auto-detect) [default: 0]
+  -t, --timeout <MS>                 Reply timeout in milliseconds, at least 1 [default: 500]
+      --max-block-size <BYTES>       Max negotiable blksize, 0 or at least 8 (0 = OS auto-detect) [default: 0]
   -w, --max-window-size <N>          Max RFC 7440 window size (1 = disable) [default: 1]
       --allow-overwrite <BOOL>       Allow overwriting existing files on WRQ [default: true]
       --max-retries <N>              Max retransmission attempts [default: 10]

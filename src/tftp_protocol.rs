@@ -13,6 +13,9 @@ const OPCODE_OACK: u16 = 6;
 /// Default data payload per DATA packet (RFC 1350).
 pub const BLOCK_SIZE: usize = 512;
 
+/// Smallest blksize a client may ask for (RFC 2348).
+pub const MIN_BLKSIZE: usize = 8;
+
 /// Maximum negotiable blksize (largest payload that fits in a UDP datagram
 /// with standard IP + UDP headers: 65535 - 20 - 8 - 4 = 65503, but the
 /// common convention is 65464).
