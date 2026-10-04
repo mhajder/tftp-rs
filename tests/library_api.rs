@@ -1323,3 +1323,89 @@ async fn a_mid_transfer_timeout_never_repeats_the_oack() {
     shutdown_tx.send(true).expect("shutdown signal");
     let _ = server.await;
 }
+
+/// Start a server on a free loopback port and wait until it is listening.
+async fn start(
+    dir: &std::path::Path,
+    config: ServerConfig,
+) -> (
+    SocketAddr,
+    watch::Sender<bool>,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+    mpsc::UnboundedReceiver<ServerEvent>,
+) {
+    let reservation = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("reserve test port");
+    let listener_address = reservation.local_addr().expect("listener address");
+    drop(reservation);
+
+    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server_dir = dir.to_path_buf();
+    let server = tokio::spawn(async move {
+        run(listener_address, server_dir, events, shutdown_rx, config).await
+    });
+
+    wait_until_listening(&mut event_rx).await;
+    (listener_address, shutdown_tx, server, event_rx)
+}
+
+#[tokio::test]
+async fn a_duplicate_ack_does_not_resend_the_next_block() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    tokio::fs::write(dir.path().join("three.bin"), vec![5_u8; 1300])
+        .await
+        .expect("test file");
+    let (listener_address, shutdown_tx, server, _events) =
+        start(dir.path(), ServerConfig::default()).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    client
+        .send_to(&rrq("three.bin"), listener_address)
+        .await
+        .expect("RRQ");
+
+    let mut buffer = [0_u8; 616];
+    let (_, from) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("DATA 1 timeout")
+        .expect("datagram");
+    assert_eq!(&buffer[..4], &[0, 3, 0, 1]);
+
+    // The ACK for block 1 arrives twice, as it does when it was only late and
+    // the client answered a retransmitted DATA 1 as well.
+    client.send_to(&[0, 4, 0, 1], from).await.expect("ACK 1");
+    client
+        .send_to(&[0, 4, 0, 1], from)
+        .await
+        .expect("ACK 1 again");
+
+    tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("DATA 2 timeout")
+        .expect("datagram");
+    assert_eq!(&buffer[..4], &[0, 3, 0, 2]);
+
+    // Only a timeout may resend a block. Well inside the 500 ms timeout,
+    // nothing more should arrive.
+    let again =
+        tokio::time::timeout(Duration::from_millis(250), client.recv_from(&mut buffer)).await;
+    assert!(
+        again.is_err(),
+        "a duplicate ACK made the server send block {} again",
+        u16::from_be_bytes([buffer[2], buffer[3]])
+    );
+
+    client.send_to(&[0, 4, 0, 2], from).await.expect("ACK 2");
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("DATA 3 timeout")
+        .expect("datagram");
+    assert_eq!(&buffer[..4], &[0, 3, 0, 3]);
+    assert_eq!(n, 4 + 276);
+    client.send_to(&[0, 4, 0, 3], from).await.expect("ACK 3");
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
