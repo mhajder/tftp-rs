@@ -1937,15 +1937,8 @@ async fn a_promoted_upload_leaves_its_staging_name_alone() {
     send_data(&client, from, 1, b"short").await;
     expect_ack(&client, 1).await;
 
-    // Once the upload is in place, while the server is still dallying,
-    // something else uses the staging name; the first transfer is number 1.
-    let promoted = tokio::time::timeout(Duration::from_secs(2), async {
-        while !dir.path().join("fw.bin").exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    assert!(promoted.is_ok(), "the upload was never promoted");
+    // The upload is in place and the server is still dallying. Something
+    // else now uses the staging name; the first transfer is number 1.
     let reused = dir.path().join("fw.bin.1.part");
     tokio::fs::write(&reused, b"someone else's")
         .await
@@ -1962,6 +1955,190 @@ async fn a_promoted_upload_leaves_its_staging_name_alone() {
             .expect("upload"),
         b"short"
     );
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
+
+/// Receive `count` DATA packets and return their block numbers.
+async fn receive_blocks(client: &UdpSocket, count: usize) -> Vec<u16> {
+    let mut buffer = [0_u8; 616];
+    let mut blocks = Vec::new();
+    for _ in 0..count {
+        tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+            .await
+            .expect("DATA timeout")
+            .expect("datagram");
+        assert_eq!(&buffer[..2], &[0, 3]);
+        blocks.push(u16::from_be_bytes([buffer[2], buffer[3]]));
+    }
+    blocks
+}
+
+#[tokio::test]
+async fn a_late_window_ack_does_not_resend_the_next_window() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    // Twelve full eight-byte blocks, then the empty block that ends it.
+    tokio::fs::write(dir.path().join("win.bin"), b"abcdefgh".repeat(12))
+        .await
+        .expect("test file");
+    let (listener_address, shutdown_tx, server, _events) = start(
+        dir.path(),
+        ServerConfig {
+            max_window_size: 4,
+            ..ServerConfig::default()
+        },
+    )
+    .await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    client
+        .send_to(
+            &rrq_with_options("win.bin", &[("blksize", "8"), ("windowsize", "4")]),
+            listener_address,
+        )
+        .await
+        .expect("RRQ");
+    let mut buffer = [0_u8; 616];
+    let (_, from) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("OACK timeout")
+        .expect("datagram");
+    assert_eq!(&buffer[..2], &[0, 6]);
+    client.send_to(&[0, 4, 0, 0], from).await.expect("ACK 0");
+
+    // The first window, then the same window again once the server's
+    // timeout passes without an ACK.
+    assert_eq!(receive_blocks(&client, 4).await, [1, 2, 3, 4]);
+    assert_eq!(receive_blocks(&client, 4).await, [1, 2, 3, 4]);
+    // One ACK for each copy, as a client that answers every window does.
+    client.send_to(&[0, 4, 0, 4], from).await.expect("ACK 4");
+    client
+        .send_to(&[0, 4, 0, 4], from)
+        .await
+        .expect("ACK 4 again");
+
+    assert_eq!(receive_blocks(&client, 4).await, [5, 6, 7, 8]);
+    let again =
+        tokio::time::timeout(Duration::from_millis(250), client.recv_from(&mut buffer)).await;
+    assert!(
+        again.is_err(),
+        "the second ACK 4 had block {} sent again",
+        u16::from_be_bytes([buffer[2], buffer[3]])
+    );
+
+    client.send_to(&[0, 4, 0, 8], from).await.expect("ACK 8");
+    assert_eq!(receive_blocks(&client, 4).await, [9, 10, 11, 12]);
+    client.send_to(&[0, 4, 0, 12], from).await.expect("ACK 12");
+    assert_eq!(receive_blocks(&client, 1).await, [13]);
+    client.send_to(&[0, 4, 0, 13], from).await.expect("ACK 13");
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
+
+#[tokio::test]
+async fn a_late_ack_to_the_oack_does_not_resend_the_first_window() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    tokio::fs::write(dir.path().join("win.bin"), b"abcdefgh".repeat(7))
+        .await
+        .expect("test file");
+    let (listener_address, shutdown_tx, server, _events) = start(
+        dir.path(),
+        ServerConfig {
+            max_window_size: 4,
+            ..ServerConfig::default()
+        },
+    )
+    .await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    client
+        .send_to(
+            &rrq_with_options("win.bin", &[("blksize", "8"), ("windowsize", "4")]),
+            listener_address,
+        )
+        .await
+        .expect("RRQ");
+    let mut buffer = [0_u8; 616];
+    // The OACK, and the same OACK again once the timeout passes.
+    let mut from = None;
+    for _ in 0..2 {
+        let (_, sender) =
+            tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+                .await
+                .expect("OACK timeout")
+                .expect("datagram");
+        assert_eq!(&buffer[..2], &[0, 6]);
+        from = Some(sender);
+    }
+    let from = from.expect("server address");
+    client.send_to(&[0, 4, 0, 0], from).await.expect("ACK 0");
+    client
+        .send_to(&[0, 4, 0, 0], from)
+        .await
+        .expect("ACK 0 again");
+
+    assert_eq!(receive_blocks(&client, 4).await, [1, 2, 3, 4]);
+    let again =
+        tokio::time::timeout(Duration::from_millis(250), client.recv_from(&mut buffer)).await;
+    assert!(
+        again.is_err(),
+        "the second ACK 0 had block {} sent again",
+        u16::from_be_bytes([buffer[2], buffer[3]])
+    );
+
+    client.send_to(&[0, 4, 0, 4], from).await.expect("ACK 4");
+    assert_eq!(receive_blocks(&client, 4).await, [5, 6, 7, 8]);
+    client.send_to(&[0, 4, 0, 8], from).await.expect("ACK 8");
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
+
+#[tokio::test]
+async fn stray_packets_do_not_draw_copies_of_the_oack() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    tokio::fs::write(dir.path().join("win.bin"), b"abcdefgh".repeat(3))
+        .await
+        .expect("test file");
+    let (listener_address, shutdown_tx, server, _events) = start(
+        dir.path(),
+        ServerConfig {
+            max_window_size: 4,
+            ..ServerConfig::default()
+        },
+    )
+    .await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    client
+        .send_to(
+            &rrq_with_options("win.bin", &[("blksize", "8"), ("windowsize", "4")]),
+            listener_address,
+        )
+        .await
+        .expect("RRQ");
+    let mut buffer = [0_u8; 616];
+    let (_, from) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("OACK timeout")
+        .expect("datagram");
+    assert_eq!(&buffer[..2], &[0, 6]);
+
+    // Packets that are not ACK 0, well inside the server's 500 ms timeout.
+    for block in [5_u16, 9, 2] {
+        let mut ack = vec![0, 4];
+        ack.extend_from_slice(&block.to_be_bytes());
+        client.send_to(&ack, from).await.expect("stray ACK");
+    }
+    let copy =
+        tokio::time::timeout(Duration::from_millis(250), client.recv_from(&mut buffer)).await;
+    assert!(copy.is_err(), "a stray packet was answered with the OACK");
+
+    client.send_to(&[0, 4, 0, 0], from).await.expect("ACK 0");
+    assert_eq!(receive_blocks(&client, 4).await, [1, 2, 3, 4]);
+    client.send_to(&[0, 4, 0, 4], from).await.expect("ACK 4");
 
     shutdown_tx.send(true).expect("shutdown signal");
     server.await.expect("server task").expect("server result");
