@@ -8,10 +8,11 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
+use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, watch};
 use tokio_util::io::ReaderStream;
 
-use tftp_rs::server::{ServerEvent, sanitize_path, single_line};
+use tftp_rs::server::{ServerEvent, is_upload_staging_name, sanitize_path, single_line};
 
 struct HttpState {
     dir: PathBuf,
@@ -86,6 +87,14 @@ async fn serve_path(
         return (StatusCode::NOT_FOUND, "Not found").into_response();
     };
 
+    // A TFTP upload still in progress: what is there now is not the file.
+    if resolved
+        .file_name()
+        .is_some_and(|name| is_upload_staging_name(&name.to_string_lossy()))
+    {
+        return (StatusCode::NOT_FOUND, "Not found").into_response();
+    }
+
     let Ok(metadata) = tokio::fs::metadata(&resolved).await else {
         return (StatusCode::NOT_FOUND, "Not found").into_response();
     };
@@ -107,8 +116,6 @@ async fn serve_path(
             format!("inline; filename=\"{}\"", sanitize_filename(&filename))
         };
 
-        let file_size = metadata.len();
-
         // Stream the file instead of loading it all into memory.
         let file = match tokio::fs::File::open(&resolved).await {
             Ok(f) => f,
@@ -116,7 +123,13 @@ async fn serve_path(
                 return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read file").into_response();
             }
         };
-        let stream = ReaderStream::new(file);
+        // The length is taken from the open file and the body is held to it.
+        // The file can be replaced or grow at any moment, and a body longer
+        // than the content-length already sent makes hyper abort the response.
+        let Ok(file_size) = file.metadata().await.map(|m| m.len()) else {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read file").into_response();
+        };
+        let stream = ReaderStream::new(file.take(file_size));
         let body = Body::from_stream(stream);
 
         (
@@ -206,6 +219,9 @@ fn render_directory(dir: &Path, display_path: &str) -> std::io::Result<String> {
     for entry in &entries {
         let name = entry.file_name().to_string_lossy().to_string();
         let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        if !is_dir && is_upload_staging_name(&name) {
+            continue;
+        }
 
         let base = display_path.trim_end_matches('/');
         let href = if is_dir {
@@ -341,5 +357,79 @@ fn human_bytes(b: u64) -> String {
         format!("{:.1} KB", b as f64 / KB as f64)
     } else {
         format!("{b} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    fn state(dir: &Path) -> Arc<HttpState> {
+        let (tx, _) = mpsc::unbounded_channel();
+        Arc::new(HttpState {
+            dir: dir.to_path_buf(),
+            tx,
+        })
+    }
+
+    async fn get(dir: &Path, path: &str) -> Response {
+        let request = Request::builder()
+            .uri(path)
+            .body(Body::empty())
+            .expect("request");
+        serve_path(
+            State(state(dir)),
+            ConnectInfo("127.0.0.1:1".parse().expect("address")),
+            request,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_body_matches_the_declared_length_when_the_file_grows() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("growing.bin");
+        std::fs::write(&path, vec![1_u8; 1000]).expect("test file");
+
+        let response = get(dir.path(), "/growing.bin").await;
+        let declared: usize = response.headers()["content-length"]
+            .to_str()
+            .expect("header")
+            .parse()
+            .expect("length");
+
+        // More data arrives after the headers are built, before the body is
+        // read.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("append")
+            .write_all(&[2_u8; 500])
+            .expect("write");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(body.len(), declared);
+    }
+
+    #[tokio::test]
+    async fn an_upload_in_progress_is_neither_listed_nor_served() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        std::fs::write(dir.path().join("fw.bin"), b"done").expect("test file");
+        std::fs::write(dir.path().join("fw.bin.7.part"), b"half").expect("staging file");
+
+        let listing = get(dir.path(), "/").await;
+        let html = axum::body::to_bytes(listing.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let html = String::from_utf8_lossy(&html);
+        assert!(html.contains("fw.bin"));
+        assert!(!html.contains(".part"), "{html}");
+
+        let response = get(dir.path(), "/fw.bin.7.part").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
