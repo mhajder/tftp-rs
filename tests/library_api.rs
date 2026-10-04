@@ -1409,3 +1409,50 @@ async fn a_duplicate_ack_does_not_resend_the_next_block() {
     shutdown_tx.send(true).expect("shutdown signal");
     server.await.expect("server task").expect("server result");
 }
+
+#[tokio::test]
+async fn an_oversized_datagram_does_not_stop_the_listener() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    tokio::fs::write(dir.path().join("small.bin"), b"still here")
+        .await
+        .expect("test file");
+    let (listener_address, shutdown_tx, server, _events) =
+        start(dir.path(), ServerConfig::default()).await;
+
+    // As large as this host will send. Linux and Windows take a full UDP
+    // payload; macOS caps a datagram at net.inet.udp.maxdgram.
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    let mut sent = false;
+    for size in [65_507_usize, 16_384, 9_216, 8_192] {
+        if client
+            .send_to(&vec![0_u8; size], listener_address)
+            .await
+            .is_ok()
+        {
+            sent = true;
+            break;
+        }
+    }
+    assert!(sent, "no oversized datagram could be sent");
+
+    client
+        .send_to(&rrq("small.bin"), listener_address)
+        .await
+        .expect("RRQ");
+    // The junk datagram is answered with an error of its own first.
+    let mut buffer = [0_u8; 616];
+    let (n, from) = loop {
+        let (n, from) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+            .await
+            .expect("the listener stopped answering")
+            .expect("datagram");
+        if buffer[..2] != [0, 5] {
+            break (n, from);
+        }
+    };
+    assert_eq!(&buffer[..n], b"\0\x03\0\x01still here");
+    client.send_to(&[0, 4, 0, 1], from).await.expect("ACK 1");
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
