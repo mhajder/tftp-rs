@@ -23,6 +23,18 @@ use crate::tftp_protocol::{
 /// Maximum UDP datagram size we ever expect (4-byte header + max blksize).
 const MAX_PACKET: usize = 4 + MAX_BLKSIZE;
 
+/// Receive buffer for the listener, larger than the largest UDP payload over
+/// either IPv4 or IPv6.
+const LISTENER_BUFFER: usize = 65536;
+
+/// How long the listener waits after a failed receive before the next one.
+const LISTENER_ERROR_PAUSE: Duration = Duration::from_millis(10);
+
+/// Failed receives in a row, with nothing received in between, after which
+/// the listener is taken to be broken rather than hit by a bad datagram:
+/// about a second of nothing but errors.
+const LISTENER_MAX_CONSECUTIVE_ERRORS: u32 = 100;
+
 /// Default timeout before retransmitting (milliseconds).
 const DEFAULT_TIMEOUT_MS: u64 = 500;
 
@@ -736,7 +748,11 @@ async fn run_inner(
 
     let dir = Arc::new(dir);
     let config = Arc::new(config);
-    let mut buf = vec![0u8; MAX_PACKET];
+    // Larger than any UDP payload. Windows reports a datagram that does not
+    // fit the buffer as an error instead of truncating it, and a request has
+    // to be read whole to be answered at all.
+    let mut buf = vec![0u8; LISTENER_BUFFER];
+    let mut consecutive_errors = 0u32;
     let mut next_id: u64 = 1;
     let mut malformed_replies = ReplyBudget::new();
 
@@ -756,7 +772,30 @@ async fn run_inner(
     loop {
         tokio::select! {
             result = sock.recv_from(&mut buf) => {
-                let (n, peer) = result?;
+                let (n, peer) = match result {
+                    Ok(received) => {
+                        consecutive_errors = 0;
+                        received
+                    }
+                    // Whatever went wrong usually went wrong for one datagram,
+                    // which anyone can send, and returning would stop the
+                    // whole service. The pause keeps an error that does repeat
+                    // from spinning the loop. One that never clears, from a
+                    // socket that is gone, is fatal after all: carrying on
+                    // would log a hundred lines a second for ever while
+                    // serving nothing and looking alive.
+                    Err(e) => {
+                        consecutive_errors += 1;
+                        if consecutive_errors >= LISTENER_MAX_CONSECUTIVE_ERRORS {
+                            return Err(anyhow!(
+                                "listener failed {consecutive_errors} times in a row: {e}"
+                            ));
+                        }
+                        let _ = tx.send(log_event(format!("receive error on listener: {e}")));
+                        tokio::time::sleep(LISTENER_ERROR_PAUSE).await;
+                        continue;
+                    }
+                };
                 let pkt = match Packet::from_bytes(&buf[..n]) {
                     Ok(p) => p,
                     Err(e) => {
