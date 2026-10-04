@@ -13,7 +13,7 @@ use anyhow::{Result, anyhow};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, timeout, timeout_at};
 
 use crate::tftp_protocol::{
     BLOCK_SIZE, DEFAULT_WINDOWSIZE, MAX_BLKSIZE, MAX_TIMEOUT, MIN_TIMEOUT, NetasciiDecoder,
@@ -1347,44 +1347,34 @@ async fn handle_rrq(
             pkt_bytes.extend_from_slice(&payload);
 
             let mut retries = 0u32;
+            send_resilient(&sock, &pkt_bytes).await?;
+            let mut deadline = tokio::time::Instant::now() + timeout_dur;
             loop {
-                send_resilient(&sock, &pkt_bytes).await?;
-                match timeout(timeout_dur, sock.recv(&mut recv_buf)).await {
-                    Ok(Ok(n)) => {
-                        let Ok(ack) = Packet::from_bytes(&recv_buf[..n]) else {
-                            retries += 1;
-                            if retries > max_retries {
-                                return Err(anyhow!(
-                                    "no acknowledgment for block {block_num} after {max_retries} attempts"
-                                ));
-                            }
-                            continue;
-                        };
-                        match ack {
-                            Packet::ACK { block_num: bn } if bn == block_num => break,
-                            Packet::ERROR { code, msg } => {
-                                return Err(anyhow!("client error {code}: {msg}"));
-                            }
-                            // A duplicate or out-of-range ACK means resend,
-                            // but it must not buy the client another attempt
-                            // for free: each 4-byte ACK can cost the server a
-                            // full block in reply.
-                            _ => {
-                                retries += 1;
-                                if retries > max_retries {
-                                    return Err(anyhow!(
-                                        "no acknowledgment for block {block_num} after {max_retries} attempts"
-                                    ));
-                                }
-                            }
+                match timeout_at(deadline, sock.recv(&mut recv_buf)).await {
+                    Ok(Ok(n)) => match Packet::from_bytes(&recv_buf[..n]) {
+                        Ok(Packet::ACK { block_num: bn }) if bn == block_num => break,
+                        Ok(Packet::ERROR { code, msg }) => {
+                            return Err(anyhow!("client error {code}: {msg}"));
                         }
-                    }
+                        // Only a timeout resends (RFC 1123 4.2.3.1). A
+                        // duplicate ACK for the previous block is what a late
+                        // ACK looks like once the block has been resent, and
+                        // answering it too would send every block after it
+                        // twice for the rest of the transfer. Anything else is
+                        // ignored the same way. The deadline is not moved, so
+                        // a stream of such packets cannot hold a transfer open.
+                        _ => {}
+                    },
                     Ok(Err(e)) => return Err(e.into()),
                     Err(_) => {
                         retries += 1;
                         if retries > max_retries {
-                            return Err(anyhow!("timeout after {max_retries} retries"));
+                            return Err(anyhow!(
+                                "no acknowledgment for block {block_num} after {max_retries} retries"
+                            ));
                         }
+                        send_resilient(&sock, &pkt_bytes).await?;
+                        deadline = tokio::time::Instant::now() + timeout_dur;
                     }
                 }
             }
