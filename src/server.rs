@@ -889,16 +889,10 @@ async fn run_inner(
                         let interface2 = interface.clone();
                         let rip = Arc::clone(&reqs_in_progress);
                         tokio::spawn(async move {
-                            let result = handle_wrq(TransferContext { id, peer, local_addr, interface: interface2, dir: dir2.clone(), tx: tx2.clone(), config: cfg }, &filename, &mode, &options).await;
+                            let result = handle_wrq(TransferContext { id, peer, local_addr, interface: interface2, dir: dir2, tx: tx2.clone(), config: cfg }, &filename, &mode, &options).await;
                             rip.lock().await.remove(&peer);
                             drop(slot);
                             if let Err(e) = result {
-                                // Clean up this transfer's staging file. The
-                                // id keeps it distinct from any other upload
-                                // of the same name that is still running.
-                                if let Ok(final_path) = sanitize_path(&dir2, &filename) {
-                                    let _ = tokio::fs::remove_file(part_path(&final_path, id)).await;
-                                }
                                 let _ = tx2.send(ServerEvent::TransferFailed { id, error: e.to_string() });
                                 let _ = tx2.send(log_event(format!("{peer}: WRQ error: {e}")));
                             }
@@ -980,6 +974,58 @@ fn part_path(path: &Path, id: u64) -> PathBuf {
     let mut staged = path.as_os_str().to_owned();
     staged.push(format!(".{id}.part"));
     PathBuf::from(staged)
+}
+
+/// An upload's staging file, removed when this is dropped.
+///
+/// The upload handler holds it, because only the handler knows the path it
+/// actually created. Working the path out again afterwards from the filename
+/// can give a different answer, for instance once a symlink has appeared at
+/// the target, and would leave the staging file behind. Dropping covers every
+/// way out of the handler, an early return as much as a panic.
+///
+/// Once the upload has been renamed into place the guard is disarmed with
+/// [`StagingFile::promoted`]. The staging name is free again from then on,
+/// and whatever appears under it is no longer this transfer's to remove.
+struct StagingFile {
+    path: PathBuf,
+    promoted: bool,
+}
+
+impl StagingFile {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            promoted: false,
+        }
+    }
+
+    fn promoted(&mut self) {
+        self.promoted = true;
+    }
+}
+
+impl Drop for StagingFile {
+    fn drop(&mut self) {
+        if !self.promoted {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// The TFTP error a failed file operation is reported to the client as.
+fn file_error_reply(error: &std::io::Error) -> (u16, &'static str) {
+    let out_of_space = matches!(
+        error.kind(),
+        std::io::ErrorKind::StorageFull
+            | std::io::ErrorKind::QuotaExceeded
+            | std::io::ErrorKind::FileTooLarge
+    );
+    if out_of_space {
+        (3, "Disk full or allocation exceeded")
+    } else {
+        (2, "Access violation")
+    }
 }
 
 /// A request that failed before the transfer started, carrying the TFTP error
@@ -1620,6 +1666,37 @@ async fn handle_wrq(
         return Err(report_failure(local_addr, interface.as_ref(), peer, failure).await);
     }
 
+    // Everything that can refuse the upload has to happen before the first
+    // acknowledgment. After it the client sends its data to the transfer
+    // socket, and an error from anywhere else is one it discards.
+    //
+    // Write to a temporary ".part" file so that incomplete uploads are
+    // never mistaken for valid files.  On success we rename to the real
+    // path; on failure the .part file is removed when `staging` drops.
+    let staged_at = part_path(&path, id);
+    let created = async {
+        // Ensure parent directories exist for subdirectory uploads.
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| (e, parent))?;
+        }
+        tokio::fs::File::create(&staged_at)
+            .await
+            .map_err(|e| (e, staged_at.as_path()))
+    }
+    .await;
+    let mut file = match created {
+        Ok(file) => file,
+        Err((e, at)) => {
+            let (code, message) = file_error_reply(&e);
+            let error = anyhow!("cannot create {}: {e}", at.display());
+            let failure = RequestFailure::new(code, message, error);
+            return Err(report_failure(local_addr, interface.as_ref(), peer, failure).await);
+        }
+    };
+    let mut staging = StagingFile::new(staged_at);
+
     let _ = tx.send(ServerEvent::TransferStarted(TransferInfo {
         id,
         peer,
@@ -1676,19 +1753,7 @@ async fn handle_wrq(
         }
     };
 
-    // Ensure parent directories exist for subdirectory uploads.
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-
-    // Write to a temporary ".part" file so that incomplete uploads are
-    // never mistaken for valid files.  On success we rename to the real
-    // path; on failure the .part file is cleaned up.
-    let part_path = part_path(&path, id);
-
-    let mut file = tokio::fs::File::create(&part_path)
-        .await
-        .map_err(|e| anyhow!("cannot create {}: {e}", part_path.display()))?;
+    let part_path = staging.path.clone();
 
     let mut transferred: u64 = 0;
     let mut expected_block: u16 = 1;
@@ -1942,6 +2007,7 @@ async fn handle_wrq(
                 path.display()
             )
         })?;
+        staging.promoted();
     } else {
         // rename() replaces the destination, which would silently overwrite a
         // file that appeared while this upload was running. Linking fails if
@@ -1950,7 +2016,9 @@ async fn handle_wrq(
         // filesystem boundary.
         match tokio::fs::hard_link(&part_path, &path).await {
             Ok(()) => {
-                let _ = tokio::fs::remove_file(&part_path).await;
+                // The upload is in place under its own name, and dropping
+                // the staging file now removes the other link to it.
+                drop(staging);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 let error = Packet::ERROR {
@@ -1981,6 +2049,7 @@ async fn handle_wrq(
                         path.display()
                     )
                 })?;
+                staging.promoted();
             }
         }
     }

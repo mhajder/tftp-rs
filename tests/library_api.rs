@@ -1456,3 +1456,174 @@ async fn an_oversized_datagram_does_not_stop_the_listener() {
     shutdown_tx.send(true).expect("shutdown signal");
     server.await.expect("server task").expect("server result");
 }
+
+#[tokio::test]
+async fn an_upload_that_cannot_be_stored_is_refused_before_it_starts() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    // A regular file where the upload needs a directory.
+    tokio::fs::write(dir.path().join("plain.txt"), b"not a directory")
+        .await
+        .expect("test file");
+    let (listener_address, shutdown_tx, server, _events) =
+        start(dir.path(), ServerConfig::default()).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    let mut request = Vec::from(&2_u16.to_be_bytes()[..]);
+    request.extend_from_slice(b"plain.txt/inner.bin\0octet\0");
+    client
+        .send_to(&request, listener_address)
+        .await
+        .expect("WRQ");
+
+    let mut buffer = [0_u8; 616];
+    tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("the server never answered")
+        .expect("datagram");
+    assert_eq!(
+        &buffer[..4],
+        &[0, 5, 0, 2],
+        "expected Access violation, not an acknowledgment"
+    );
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_upload_removes_its_own_staging_file() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    tokio::fs::write(dir.path().join("other.bin"), b"unrelated")
+        .await
+        .expect("test file");
+    let (listener_address, shutdown_tx, server, _events) =
+        start(dir.path(), ServerConfig::default()).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    let mut request = Vec::from(&2_u16.to_be_bytes()[..]);
+    request.extend_from_slice(b"new.bin\0octet\0");
+    client
+        .send_to(&request, listener_address)
+        .await
+        .expect("WRQ");
+
+    let mut buffer = [0_u8; 616];
+    let (_, from) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("ACK 0 timeout")
+        .expect("datagram");
+    assert_eq!(&buffer[..4], &[0, 4, 0, 0]);
+
+    let mut data = vec![0, 3, 0, 1];
+    data.extend_from_slice(&[1_u8; 512]);
+    client.send_to(&data, from).await.expect("DATA 1");
+    tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("ACK 1 timeout")
+        .expect("datagram");
+
+    // The name now resolves somewhere else, so working the staging path out
+    // again from the filename would no longer find this upload's file.
+    std::os::unix::fs::symlink(dir.path().join("other.bin"), dir.path().join("new.bin"))
+        .expect("symlink");
+    client
+        .send_to(b"\0\x05\0\0client gave up\0", from)
+        .await
+        .expect("ERROR");
+
+    let names = || -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("served directory")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    };
+    let cleaned = tokio::time::timeout(Duration::from_secs(2), async {
+        while names().len() != 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(cleaned.is_ok(), "staging file left behind: {:?}", names());
+    assert_eq!(names(), ["new.bin", "other.bin"]);
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
+
+/// Send DATA `block` carrying `payload` to `to`.
+async fn send_data(client: &UdpSocket, to: SocketAddr, block: u16, payload: &[u8]) {
+    let mut data = Vec::from(&3_u16.to_be_bytes()[..]);
+    data.extend_from_slice(&block.to_be_bytes());
+    data.extend_from_slice(payload);
+    client.send_to(&data, to).await.expect("DATA");
+}
+
+/// Wait for an ACK of `block`, skipping any ACK for an earlier one.
+async fn expect_ack(client: &UdpSocket, block: u16) {
+    let mut buffer = [0_u8; 616];
+    loop {
+        tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+            .await
+            .unwrap_or_else(|_| panic!("no ACK {block}"))
+            .expect("datagram");
+        assert_eq!(&buffer[..2], &[0, 4], "expected an ACK");
+        if u16::from_be_bytes([buffer[2], buffer[3]]) == block {
+            return;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_promoted_upload_leaves_its_staging_name_alone() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let (listener_address, shutdown_tx, server, _events) =
+        start(dir.path(), ServerConfig::default()).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    let mut request = Vec::from(&2_u16.to_be_bytes()[..]);
+    request.extend_from_slice(b"fw.bin\0octet\0");
+    client
+        .send_to(&request, listener_address)
+        .await
+        .expect("WRQ");
+    let mut buffer = [0_u8; 616];
+    let (_, from) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("ACK 0 timeout")
+        .expect("datagram");
+    send_data(&client, from, 1, b"short").await;
+    expect_ack(&client, 1).await;
+
+    // Once the upload is in place, while the server is still dallying,
+    // something else uses the staging name; the first transfer is number 1.
+    let promoted = tokio::time::timeout(Duration::from_secs(2), async {
+        while !dir.path().join("fw.bin").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(promoted.is_ok(), "the upload was never promoted");
+    let reused = dir.path().join("fw.bin.1.part");
+    tokio::fs::write(&reused, b"someone else's")
+        .await
+        .expect("file at the staging name");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    assert!(
+        reused.exists(),
+        "the finished transfer removed a file it does not own"
+    );
+    assert_eq!(
+        tokio::fs::read(dir.path().join("fw.bin"))
+            .await
+            .expect("upload"),
+        b"short"
+    );
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
