@@ -1856,9 +1856,15 @@ async fn handle_wrq(
                 } else {
                     data.clone()
                 };
-                file.write_all(&to_write).await?;
+                stored(&sock, &path, file.write_all(&to_write).await).await?;
                 transferred += to_write.len() as u64;
                 refuse_oversized_upload(&sock, transferred, config.max_upload_bytes).await?;
+            }
+
+            // The final ACK waits until the file is in place.
+            if last_block {
+                last_block_num = expected_block.wrapping_sub(1);
+                break;
             }
 
             // ACK the last block we received.
@@ -1879,11 +1885,6 @@ async fn handle_wrq(
                 transferred,
                 total_bytes: report_total,
             });
-
-            if last_block {
-                last_block_num = expected_block.wrapping_sub(1);
-                break;
-            }
         }
     } else {
         // --- Classic single-block WRQ ---
@@ -1957,9 +1958,15 @@ async fn handle_wrq(
             };
 
             // Write directly to disk.
-            file.write_all(&to_write).await?;
+            stored(&sock, &path, file.write_all(&to_write).await).await?;
             transferred += to_write.len() as u64;
             refuse_oversized_upload(&sock, transferred, config.max_upload_bytes).await?;
+
+            // The final ACK waits until the file is in place.
+            if is_last {
+                last_block_num = expected_block;
+                break;
+            }
 
             // ACK this block.
             let ack = Packet::ACK {
@@ -1978,10 +1985,6 @@ async fn handle_wrq(
                 total_bytes: report_total,
             });
 
-            if is_last {
-                last_block_num = expected_block;
-                break;
-            }
             expected_block = expected_block.wrapping_add(1);
         }
     }
@@ -1990,23 +1993,23 @@ async fn handle_wrq(
     if let Some(ref mut dec) = decoder {
         let tail = dec.finish();
         if !tail.is_empty() {
-            file.write_all(&tail).await?;
+            stored(&sock, &path, file.write_all(&tail).await).await?;
             transferred += tail.len() as u64;
         }
     }
 
-    file.flush().await?;
+    // Everything up to here can still fail, and the client has to hear about
+    // it, so the last block is acknowledged only once the file is in place.
+    // An ACK sent earlier tells the client the upload is complete, and after
+    // that it stops listening. tokio's write_all hands the data to a
+    // background write and returns, so a write that fails, on a full disk
+    // for instance, only reports it here.
+    stored(&sock, &path, file.flush().await).await?;
     drop(file);
 
     // Atomically promote the completed .part file to its final name.
     if config.allow_overwrite {
-        tokio::fs::rename(&part_path, &path).await.map_err(|e| {
-            anyhow!(
-                "failed to rename {} -> {}: {e}",
-                part_path.display(),
-                path.display()
-            )
-        })?;
+        stored(&sock, &path, tokio::fs::rename(&part_path, &path).await).await?;
         staging.promoted();
     } else {
         // rename() replaces the destination, which would silently overwrite a
@@ -2031,9 +2034,8 @@ async fn handle_wrq(
             Err(_) => {
                 // FAT, exFAT, many SMB mounts and some container volume
                 // drivers have no hard links. Refusing to promote there would
-                // discard a file the client has already been told arrived, so
-                // fall back to a rename and accept that the existence check is
-                // no longer atomic.
+                // make every upload fail on them, so fall back to a rename and
+                // accept that the existence check is no longer atomic.
                 if path.exists() {
                     let error = Packet::ERROR {
                         code: 6,
@@ -2042,17 +2044,28 @@ async fn handle_wrq(
                     let _ = send_resilient(&sock, &error.to_bytes()).await;
                     return Err(anyhow!("file already exists: {}", path.display()));
                 }
-                tokio::fs::rename(&part_path, &path).await.map_err(|e| {
-                    anyhow!(
-                        "failed to rename {} -> {}: {e}",
-                        part_path.display(),
-                        path.display()
-                    )
-                })?;
+                stored(&sock, &path, tokio::fs::rename(&part_path, &path).await).await?;
                 staging.promoted();
             }
         }
     }
+
+    let final_ack = Packet::ACK {
+        block_num: last_block_num,
+    }
+    .to_bytes();
+    // The file is stored whether or not this one gets through. A client that
+    // misses it retransmits, and the dally below answers that.
+    let _ = send_resilient(&sock, &final_ack).await;
+    let _ = tx.send(ServerEvent::TransferProgress {
+        id,
+        transferred,
+        total_bytes: if expected_size > 0 {
+            expected_size
+        } else {
+            transferred
+        },
+    });
 
     let _ = tx.send(ServerEvent::TransferComplete(id));
     let _ = tx.send(log_event(format!(
@@ -2070,10 +2083,6 @@ async fn handle_wrq(
     // per upload, and its own next request would be turned away as a
     // duplicate.
     let dally_for = timeout_dur.min(MAX_DALLY);
-    let final_ack = Packet::ACK {
-        block_num: last_block_num,
-    }
-    .to_bytes();
     if let Ok(Ok(n)) = timeout(dally_for, sock.recv(&mut recv_buf)).await
         && matches!(
             Packet::from_bytes(&recv_buf[..n]),
@@ -2093,6 +2102,25 @@ async fn handle_wrq(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Pass a file operation's result through, telling the client when it failed.
+///
+/// The error goes out on the transfer's own socket, for the same reason as in
+/// [`refuse_oversized_upload`].
+async fn stored<T>(sock: &UdpSocket, path: &Path, result: std::io::Result<T>) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(e) => {
+            let (code, message) = file_error_reply(&e);
+            let error = Packet::ERROR {
+                code,
+                msg: message.into(),
+            };
+            let _ = send_resilient(sock, &error.to_bytes()).await;
+            Err(anyhow!("cannot store {}: {e}", path.display()))
+        }
+    }
+}
 
 /// Stop an upload that has grown past the configured ceiling.
 ///

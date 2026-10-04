@@ -1554,6 +1554,131 @@ async fn a_failed_upload_removes_its_own_staging_file() {
     server.await.expect("server task").expect("server result");
 }
 
+#[tokio::test]
+async fn an_upload_that_cannot_be_promoted_is_never_acknowledged_as_complete() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let (listener_address, shutdown_tx, server, _events) = start(
+        dir.path(),
+        ServerConfig {
+            allow_overwrite: false,
+            ..ServerConfig::default()
+        },
+    )
+    .await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    let mut request = Vec::from(&2_u16.to_be_bytes()[..]);
+    request.extend_from_slice(b"late.bin\0octet\0");
+    client
+        .send_to(&request, listener_address)
+        .await
+        .expect("WRQ");
+
+    let mut buffer = [0_u8; 616];
+    let (_, from) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("ACK 0 timeout")
+        .expect("datagram");
+    assert_eq!(&buffer[..4], &[0, 4, 0, 0]);
+
+    let mut data = vec![0, 3, 0, 1];
+    data.extend_from_slice(&[1_u8; 512]);
+    client.send_to(&data, from).await.expect("DATA 1");
+    tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("ACK 1 timeout")
+        .expect("datagram");
+    assert_eq!(&buffer[..4], &[0, 4, 0, 1]);
+
+    // Someone else creates the file while the upload is running, so the
+    // upload cannot take its name.
+    tokio::fs::write(dir.path().join("late.bin"), b"first")
+        .await
+        .expect("competing file");
+
+    client
+        .send_to(b"\0\x03\0\x02last", from)
+        .await
+        .expect("DATA 2");
+    tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("no answer to the last block")
+        .expect("datagram");
+    assert_eq!(
+        &buffer[..4],
+        &[0, 5, 0, 6],
+        "the client must hear File already exists, not an ACK for a file that was never stored"
+    );
+    assert_eq!(
+        tokio::fs::read(dir.path().join("late.bin"))
+            .await
+            .expect("competing file"),
+        b"first"
+    );
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
+
+#[tokio::test]
+async fn a_windowed_upload_is_acknowledged_once_stored() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let (listener_address, shutdown_tx, server, _events) = start(
+        dir.path(),
+        ServerConfig {
+            max_window_size: 4,
+            ..ServerConfig::default()
+        },
+    )
+    .await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    client
+        .send_to(
+            &wrq_with_options("win.bin", &[("blksize", "8"), ("windowsize", "4")]),
+            listener_address,
+        )
+        .await
+        .expect("WRQ");
+
+    let mut buffer = [0_u8; 616];
+    let (_, from) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("OACK timeout")
+        .expect("datagram");
+    assert_eq!(&buffer[..2], &[0, 6]);
+
+    // Six blocks: one full window, then a window ending in a short block.
+    let mut expected = Vec::new();
+    for block in 1_u16..=6 {
+        let payload: &[u8] = if block == 6 { b"end" } else { b"12345678" };
+        expected.extend_from_slice(payload);
+        let mut data = Vec::from(&3_u16.to_be_bytes()[..]);
+        data.extend_from_slice(&block.to_be_bytes());
+        data.extend_from_slice(payload);
+        client.send_to(&data, from).await.expect("DATA");
+        if block == 4 || block == 6 {
+            tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+                .await
+                .expect("window ACK timeout")
+                .expect("datagram");
+            assert_eq!(&buffer[..2], &[0, 4]);
+            assert_eq!(u16::from_be_bytes([buffer[2], buffer[3]]), block);
+        }
+    }
+
+    // By the time the last block is acknowledged the file is in place.
+    assert_eq!(
+        tokio::fs::read(dir.path().join("win.bin"))
+            .await
+            .expect("the upload was acknowledged before it was stored"),
+        expected
+    );
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
+
 /// Send DATA `block` carrying `payload` to `to`.
 async fn send_data(client: &UdpSocket, to: SocketAddr, block: u16, payload: &[u8]) {
     let mut data = Vec::from(&3_u16.to_be_bytes()[..]);
