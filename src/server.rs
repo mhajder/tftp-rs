@@ -17,7 +17,7 @@ use tokio::time::{Duration, timeout, timeout_at};
 
 use crate::tftp_protocol::{
     BLOCK_SIZE, DEFAULT_WINDOWSIZE, MAX_BLKSIZE, MAX_TIMEOUT, MIN_BLKSIZE, MIN_TIMEOUT,
-    NetasciiDecoder, NetasciiEncoder, Packet,
+    NetasciiDecoder, NetasciiEncoder, Packet, encode_data,
 };
 
 /// Maximum UDP datagram size we ever expect (4-byte header + max blksize).
@@ -633,6 +633,35 @@ fn negotiate_options(
     }
 }
 
+/// What a transfer negotiated away from the defaults, for its log line: empty,
+/// or a bracketed list with a leading space.
+fn describe_options(
+    blksize: usize,
+    windowsize: u16,
+    timeout_ms: u64,
+    default_timeout_ms: u64,
+    is_netascii: bool,
+) -> String {
+    let mut detail_parts = Vec::new();
+    if blksize != BLOCK_SIZE {
+        detail_parts.push(format!("blksize={blksize}"));
+    }
+    if windowsize > 1 {
+        detail_parts.push(format!("windowsize={windowsize}"));
+    }
+    if timeout_ms != default_timeout_ms {
+        detail_parts.push(format!("timeout={timeout_ms}ms"));
+    }
+    if is_netascii {
+        detail_parts.push("netascii".to_string());
+    }
+    if detail_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", detail_parts.join(", "))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Server entry-point
 // ---------------------------------------------------------------------------
@@ -835,97 +864,70 @@ async fn run_inner(
                     }
                 };
 
-                match pkt {
-                    Packet::RRQ { filename, mode, options } => {
-                        if !config.enable_read {
-                            let _ = tx.send(log_event(format!("{peer}: RRQ rejected (reads disabled)")));
-                            send_error(local_addr, interface.as_ref(), peer, 2, "Read access denied").await;
-                            continue;
-                        }
-
-                        // Take a slot before anything is allocated for this
-                        // transfer. Turning the request away silently keeps a
-                        // flood from being answered packet for packet; a real
-                        // client retransmits and gets in once a slot frees.
-                        let Ok(slot) = Arc::clone(&transfer_slots).try_acquire_owned() else {
-                            let _ = tx.send(log_event(format!("{peer}: RRQ refused (too many transfers in progress)")));
-                            continue;
-                        };
-
-                        // Reject duplicate request from same peer.
-                        {
-                            let mut in_progress = reqs_in_progress.lock().await;
-                            if !in_progress.insert(peer) {
-                                let _ = tx.send(log_event(format!("{peer}: duplicate RRQ ignored (transfer in progress)")));
-                                continue;
-                            }
-                        }
-
-                        let id = next_id;
-                        next_id += 1;
-                        let tx2 = tx.clone();
-                        let dir2 = Arc::clone(&dir);
-                        let cfg = Arc::clone(&config);
-                        let interface2 = interface.clone();
-                        let rip = Arc::clone(&reqs_in_progress);
-                        tokio::spawn(async move {
-                            let result = handle_rrq(TransferContext { id, peer, local_addr, interface: interface2, dir: dir2, tx: tx2.clone(), config: cfg }, &filename, &mode, &options).await;
-                            rip.lock().await.remove(&peer);
-                            drop(slot);
-                            if let Err(e) = result {
-                                let _ = tx2.send(ServerEvent::TransferFailed { id, error: e.to_string() });
-                                let _ = tx2.send(log_event(format!("{peer}: RRQ error: {e}")));
-                            }
-                        });
-                    }
-                    Packet::WRQ { filename, mode, options } => {
-                        if !config.enable_write {
-                            let _ = tx.send(log_event(format!("{peer}: WRQ rejected (writes disabled)")));
-                            send_error(local_addr, interface.as_ref(), peer, 2, "Write access denied").await;
-                            continue;
-                        }
-
-                        // Take a slot before anything is allocated for this
-                        // transfer. Turning the request away silently keeps a
-                        // flood from being answered packet for packet; a real
-                        // client retransmits and gets in once a slot frees.
-                        let Ok(slot) = Arc::clone(&transfer_slots).try_acquire_owned() else {
-                            let _ = tx.send(log_event(format!("{peer}: WRQ refused (too many transfers in progress)")));
-                            continue;
-                        };
-
-                        // Reject duplicate request from same peer.
-                        {
-                            let mut in_progress = reqs_in_progress.lock().await;
-                            if !in_progress.insert(peer) {
-                                let _ = tx.send(log_event(format!("{peer}: duplicate WRQ ignored (transfer in progress)")));
-                                continue;
-                            }
-                        }
-
-                        let id = next_id;
-                        next_id += 1;
-                        let tx2 = tx.clone();
-                        let dir2 = Arc::clone(&dir);
-                        let cfg = Arc::clone(&config);
-                        let interface2 = interface.clone();
-                        let rip = Arc::clone(&reqs_in_progress);
-                        tokio::spawn(async move {
-                            let result = handle_wrq(TransferContext { id, peer, local_addr, interface: interface2, dir: dir2, tx: tx2.clone(), config: cfg }, &filename, &mode, &options).await;
-                            rip.lock().await.remove(&peer);
-                            drop(slot);
-                            if let Err(e) = result {
-                                let _ = tx2.send(ServerEvent::TransferFailed { id, error: e.to_string() });
-                                let _ = tx2.send(log_event(format!("{peer}: WRQ error: {e}")));
-                            }
-                        });
-                    }
+                let (kind, filename, mode, options) = match pkt {
+                    Packet::RRQ { filename, mode, options } => (TransferKind::Download, filename, mode, options),
+                    Packet::WRQ { filename, mode, options } => (TransferKind::Upload, filename, mode, options),
                     other => {
                         let _ = tx.send(log_event(format!(
                             "{peer}: unexpected packet on listener: {other:?}"
                         )));
+                        continue;
+                    }
+                };
+                let (request, enabled, disabled, denied) = match kind {
+                    TransferKind::Download => ("RRQ", config.enable_read, "reads disabled", "Read access denied"),
+                    TransferKind::Upload => ("WRQ", config.enable_write, "writes disabled", "Write access denied"),
+                };
+
+                if !enabled {
+                    let _ = tx.send(log_event(format!("{peer}: {request} rejected ({disabled})")));
+                    send_error(local_addr, interface.as_ref(), peer, 2, denied).await;
+                    continue;
+                }
+
+                // Take a slot before anything is allocated for this
+                // transfer. Turning the request away silently keeps a
+                // flood from being answered packet for packet; a real
+                // client retransmits and gets in once a slot frees.
+                let Ok(slot) = Arc::clone(&transfer_slots).try_acquire_owned() else {
+                    let _ = tx.send(log_event(format!("{peer}: {request} refused (too many transfers in progress)")));
+                    continue;
+                };
+
+                // Reject duplicate request from same peer.
+                {
+                    let mut in_progress = reqs_in_progress.lock().await;
+                    if !in_progress.insert(peer) {
+                        let _ = tx.send(log_event(format!("{peer}: duplicate {request} ignored (transfer in progress)")));
+                        continue;
                     }
                 }
+
+                let id = next_id;
+                next_id += 1;
+                let ctx = TransferContext {
+                    id,
+                    peer,
+                    local_addr,
+                    interface: interface.clone(),
+                    dir: Arc::clone(&dir),
+                    tx: tx.clone(),
+                    config: Arc::clone(&config),
+                };
+                let tx2 = tx.clone();
+                let rip = Arc::clone(&reqs_in_progress);
+                tokio::spawn(async move {
+                    let result = match kind {
+                        TransferKind::Download => handle_rrq(ctx, &filename, &mode, &options).await,
+                        TransferKind::Upload => handle_wrq(ctx, &filename, &mode, &options).await,
+                    };
+                    rip.lock().await.remove(&peer);
+                    drop(slot);
+                    if let Err(e) = result {
+                        let _ = tx2.send(ServerEvent::TransferFailed { id, error: e.to_string() });
+                        let _ = tx2.send(log_event(format!("{peer}: {request} error: {e}")));
+                    }
+                });
             }
             _ = shutdown.changed() => {
                 let _ = tx.send(log_event("Shutting down".into()));
@@ -1210,24 +1212,13 @@ async fn handle_rrq(
         }
     }
 
-    let mut detail_parts = Vec::new();
-    if blksize != BLOCK_SIZE {
-        detail_parts.push(format!("blksize={blksize}"));
-    }
-    if windowsize > 1 {
-        detail_parts.push(format!("windowsize={windowsize}"));
-    }
-    if negotiated.timeout_ms != config.timeout_ms {
-        detail_parts.push(format!("timeout={}ms", negotiated.timeout_ms));
-    }
-    if is_netascii {
-        detail_parts.push("netascii".to_string());
-    }
-    let detail_str = if detail_parts.is_empty() {
-        String::new()
-    } else {
-        format!(" [{}]", detail_parts.join(", "))
-    };
+    let detail_str = describe_options(
+        blksize,
+        windowsize,
+        negotiated.timeout_ms,
+        config.timeout_ms,
+        is_netascii,
+    );
 
     let _ = tx.send(log_event(format!(
         "{peer}: RRQ \"{filename}\" ({total_bytes} bytes){detail_str}"
@@ -1353,11 +1344,7 @@ async fn handle_rrq(
             let mut recoveries = 0u32;
             loop {
                 for (bn, payload) in &window {
-                    let mut pkt_bytes = Vec::with_capacity(4 + payload.len());
-                    pkt_bytes.extend_from_slice(&3u16.to_be_bytes());
-                    pkt_bytes.extend_from_slice(&bn.to_be_bytes());
-                    pkt_bytes.extend_from_slice(payload);
-                    send_resilient(&sock, &pkt_bytes).await?;
+                    send_resilient(&sock, &encode_data(*bn, payload)).await?;
                 }
 
                 // Wait for ACK for any block in the window.
@@ -1473,10 +1460,7 @@ async fn handle_rrq(
             let payload = read_next_block(&mut file, &mut block_buf, blksize, &mut encoder).await?;
             let is_last = payload.len() < blksize && !has_encoder_overflow(&encoder);
 
-            let mut pkt_bytes = Vec::with_capacity(4 + payload.len());
-            pkt_bytes.extend_from_slice(&3u16.to_be_bytes()); // OPCODE_DATA
-            pkt_bytes.extend_from_slice(&block_num.to_be_bytes());
-            pkt_bytes.extend_from_slice(&payload);
+            let pkt_bytes = encode_data(block_num, &payload);
 
             let mut retries = 0u32;
             send_resilient(&sock, &pkt_bytes).await?;
@@ -1683,24 +1667,13 @@ async fn handle_wrq(
         oack_options.insert("tsize".to_string(), tsize_val.clone());
     }
 
-    let mut detail_parts = Vec::new();
-    if blksize != BLOCK_SIZE {
-        detail_parts.push(format!("blksize={blksize}"));
-    }
-    if windowsize > 1 {
-        detail_parts.push(format!("windowsize={windowsize}"));
-    }
-    if negotiated.timeout_ms != config.timeout_ms {
-        detail_parts.push(format!("timeout={}ms", negotiated.timeout_ms));
-    }
-    if is_netascii {
-        detail_parts.push("netascii".to_string());
-    }
-    let detail_str = if detail_parts.is_empty() {
-        String::new()
-    } else {
-        format!(" [{}]", detail_parts.join(", "))
-    };
+    let detail_str = describe_options(
+        blksize,
+        windowsize,
+        negotiated.timeout_ms,
+        config.timeout_ms,
+        is_netascii,
+    );
 
     let _ = tx.send(log_event(format!("{peer}: WRQ \"{filename}\"{detail_str}")));
 

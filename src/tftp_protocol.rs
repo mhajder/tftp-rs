@@ -30,6 +30,15 @@ pub const MIN_TIMEOUT: u8 = 1;
 /// Maximum timeout value (seconds) per RFC 2349.
 pub const MAX_TIMEOUT: u8 = 255;
 
+/// Encode a DATA packet without first copying the payload into a [`Packet`].
+pub fn encode_data(block_num: u16, payload: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + payload.len());
+    buf.extend_from_slice(&OPCODE_DATA.to_be_bytes());
+    buf.extend_from_slice(&block_num.to_be_bytes());
+    buf.extend_from_slice(payload);
+    buf
+}
+
 /// A fully parsed TFTP packet.
 #[derive(Debug, Clone)]
 #[allow(clippy::upper_case_acronyms)]
@@ -92,13 +101,7 @@ impl Packet {
                 mode,
                 options,
             } => encode_request(OPCODE_WRQ, filename, mode, options),
-            Packet::DATA { block_num, data } => {
-                let mut buf = Vec::with_capacity(4 + data.len());
-                buf.extend_from_slice(&OPCODE_DATA.to_be_bytes());
-                buf.extend_from_slice(&block_num.to_be_bytes());
-                buf.extend_from_slice(data);
-                buf
-            }
+            Packet::DATA { block_num, data } => encode_data(*block_num, data),
             Packet::ACK { block_num } => {
                 let mut buf = Vec::with_capacity(4);
                 buf.extend_from_slice(&OPCODE_ACK.to_be_bytes());
