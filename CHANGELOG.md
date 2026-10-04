@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.4.2](https://github.com/mhajder/tftp-rs/compare/v0.4.1...v0.4.2) (2026-10-04)
+
+
+### 🐛 Bug Fixes
+
+* acknowledge the last block of an upload only once it is stored ([43a0acf](https://github.com/mhajder/tftp-rs/commit/43a0acf495c1cd2777de748b9a87ca3907f7bf70))
+* answer out-of-sequence upload blocks without spending retries ([59c9a4e](https://github.com/mhajder/tftp-rs/commit/59c9a4e78bff1a7b72f374fa512c229492cecbbb))
+* cap the dashboard's file tree as a whole, not per directory ([f6e761a](https://github.com/mhajder/tftp-rs/commit/f6e761a4f04456d7fcfea27f3f5803bcacb845f4))
+* create an upload's staging file before acknowledging it ([b526d83](https://github.com/mhajder/tftp-rs/commit/b526d8334dcf9f9cac0bd1cfdd86a7b627894208))
+* keep the HTTP server from handing out uploads in progress ([f3f9110](https://github.com/mhajder/tftp-rs/commit/f3f9110c45c07454dc331d6a38e40d8db78017f3))
+* keep the listener running after a failed receive ([3400b84](https://github.com/mhajder/tftp-rs/commit/3400b846eeaa226dab8238b440fd19169db4c911))
+* refuse a zero timeout and a block size below eight ([474eac3](https://github.com/mhajder/tftp-rs/commit/474eac3056e935e2d0f9576d90883fa6b72661da))
+* refuse TFTP reads and writes of an upload's staging file ([89f141a](https://github.com/mhajder/tftp-rs/commit/89f141ab6a6c1c85004920046cf86e723c5b74a8))
+* resend a download block only when its ACK times out ([b62a00f](https://github.com/mhajder/tftp-rs/commit/b62a00f060163fb9a881049087c8bbb461f6392a))
+* stop a late window ACK from resending every later window ([140db1d](https://github.com/mhajder/tftp-rs/commit/140db1db5a591a5b650606772fab671b923dc271))
+
+
+### 🧹 Refactoring
+
+* share request dispatch and DATA encoding between reads and writes ([a244b6e](https://github.com/mhajder/tftp-rs/commit/a244b6e8dc404f9829d24d200ae16df84895ea59))
+
 ## [0.4.1](https://github.com/mhajder/tftp-rs/compare/v0.4.0...v0.4.1) (2026-09-17)
 
 
