@@ -23,7 +23,7 @@ tsize, windowsize), netascii mode, and an optional HTTP file server.
 - **RFC 7440 windowsize** -- windowed transfers send multiple DATA blocks before waiting for ACK, significantly improving throughput on high-latency links
 - **Netascii mode** -- full bidirectional conversion (`\n` ↔ `\r\n`, `\r` ↔ `\r\0`) across block boundaries for legacy clients
 - **Unlimited transfer size** -- block numbers roll over correctly (u16 wrap-around), enabling files larger than 32 MB with the default 512-byte block size
-- **Full RRQ + WRQ** -- serve files to clients (download) and receive files from clients (upload)
+- **Full RRQ + WRQ** -- serve files to clients (download) and receive files from clients (upload); an upload is staged as `<name>.<transfer id>.part` and renamed into place once complete, and no client can read or write a staging file by name (names of the form `<name>.<number>.part`, in any letter case, are reserved for this)
 - **Subdirectory support** -- read and write files in nested directories (e.g. `ios/config/router.cfg`)
 - **Async I/O** -- built on `tokio` with non-blocking UDP sockets
 - **Ephemeral transfer sockets** -- each transfer gets its own OS-assigned port, keeping the main listener free

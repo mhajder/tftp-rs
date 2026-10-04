@@ -1056,8 +1056,9 @@ fn file_error_reply(error: &std::io::Error) -> (u16, &'static str) {
 /// by [`part_path`]: the target name, a transfer id, and `.part`.
 ///
 /// A staging file holds a partial upload, or one that is about to be
-/// discarded. Anything else that serves the same directory should not hand it
-/// out as a file.
+/// discarded. The TFTP server neither reads nor writes one by that name, and
+/// anything else that serves the same directory should not hand it out as a
+/// file either.
 ///
 /// The match ignores ASCII case, and trailing dots and spaces. macOS and
 /// Windows, and FAT everywhere, ignore case in a name, and Windows drops
@@ -1075,6 +1076,12 @@ pub fn is_upload_staging_name(name: &str) -> bool {
         return false;
     };
     !target.is_empty() && !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Whether `path` names an upload's staging file. See [`is_upload_staging_name`].
+fn is_staging_path(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| is_upload_staging_name(&name.to_string_lossy()))
 }
 
 /// A request that failed before the transfer started, carrying the TFTP error
@@ -1140,6 +1147,15 @@ async fn handle_rrq(
 
     let opened = async {
         let path = sanitize_path(dir, filename).map_err(RequestFailure::illegal)?;
+        // Half of an upload still being written, or one about to be thrown
+        // away. Not a file, whatever it holds right now.
+        if is_staging_path(&path) {
+            return Err(RequestFailure::new(
+                1,
+                "File not found",
+                anyhow!("upload in progress: {}", path.display()),
+            ));
+        }
         let metadata = tokio::fs::metadata(&path)
             .await
             .map_err(|e| match e.kind() {
@@ -1622,6 +1638,20 @@ async fn handle_wrq(
             return Err(report_failure(local_addr, interface.as_ref(), peer, failure).await);
         }
     };
+
+    // A staging name belongs to the upload that created it. Transfer ids are
+    // handed out in sequence, so the name of another client's upload in
+    // progress is easy to guess. Written to, it would have that upload
+    // promote whatever this one sent and tell its client it succeeded, and an
+    // upload that later failed would delete what this one stored there.
+    if is_staging_path(&path) {
+        let failure = RequestFailure::new(
+            2,
+            "Access violation",
+            anyhow!("refusing to write over a staging name: {}", path.display()),
+        );
+        return Err(report_failure(local_addr, interface.as_ref(), peer, failure).await);
+    }
 
     // A directory, a device node or a socket cannot be replaced by the rename
     // that promotes a finished upload. Left to be discovered at that point, the

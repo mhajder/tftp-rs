@@ -2143,3 +2143,63 @@ async fn stray_packets_do_not_draw_copies_of_the_oack() {
     shutdown_tx.send(true).expect("shutdown signal");
     server.await.expect("server task").expect("server result");
 }
+
+#[tokio::test]
+async fn a_staging_name_can_be_neither_read_nor_written() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    // As if another client's upload of fw.bin, transfer 7, were under way.
+    tokio::fs::write(dir.path().join("fw.bin.7.part"), b"half an upload")
+        .await
+        .expect("staging file");
+    let (listener_address, shutdown_tx, server, _events) =
+        start(dir.path(), ServerConfig::default()).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    let mut buffer = [0_u8; 616];
+
+    client
+        .send_to(&rrq("fw.bin.7.part"), listener_address)
+        .await
+        .expect("RRQ");
+    tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("no answer to the RRQ")
+        .expect("datagram");
+    assert_eq!(&buffer[..4], &[0, 5, 0, 1], "expected File not found");
+
+    let mut request = Vec::from(&2_u16.to_be_bytes()[..]);
+    request.extend_from_slice(b"fw.bin.7.part\0octet\0");
+    client
+        .send_to(&request, listener_address)
+        .await
+        .expect("WRQ");
+    tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("no answer to the WRQ")
+        .expect("datagram");
+    assert_eq!(&buffer[..4], &[0, 5, 0, 2], "expected Access violation");
+
+    // The same name to a filesystem that ignores case, and a new one: the
+    // next upload's staging name, guessed before that upload starts.
+    let mut request = Vec::from(&2_u16.to_be_bytes()[..]);
+    request.extend_from_slice(b"fw.bin.2.PART\0octet\0");
+    client
+        .send_to(&request, listener_address)
+        .await
+        .expect("WRQ");
+    tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+        .await
+        .expect("no answer to the WRQ")
+        .expect("datagram");
+    assert_eq!(&buffer[..4], &[0, 5, 0, 2], "expected Access violation");
+
+    assert_eq!(
+        tokio::fs::read(dir.path().join("fw.bin.7.part"))
+            .await
+            .expect("staging file"),
+        b"half an upload"
+    );
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
+}
