@@ -88,7 +88,7 @@ impl App {
             show_quit_dialog: false,
             quit_selection: false,
             interface_ips,
-            file_tree: build_tree(&dir_for_tree, 0, &[]),
+            file_tree: build_tree(&dir_for_tree),
             // Far enough back that the first frame redraws with fresh data.
             last_tree_refresh: Instant::now() - TREE_REFRESH_INTERVAL,
             last_ip_refresh: Instant::now(),
@@ -103,7 +103,7 @@ impl App {
     /// tree anyone with write access can grow.
     fn refresh_tree_if_needed(&mut self) {
         if self.last_tree_refresh.elapsed() >= TREE_REFRESH_INTERVAL {
-            self.file_tree = build_tree(&self.dir, 0, &[]);
+            self.file_tree = build_tree(&self.dir);
             self.last_tree_refresh = Instant::now();
         }
     }
@@ -258,22 +258,38 @@ struct TreeEntry {
 /// on the thread that draws the interface.
 const MAX_TREE_DEPTH: usize = 16;
 
-/// How many entries the tree will collect before it stops.
+/// How many entries the tree will collect before it stops, across the whole
+/// tree.
 ///
 /// Only a screenful is ever shown, and the alternative is walking an
 /// arbitrarily large directory on every frame.
 const MAX_TREE_ENTRIES: usize = 5_000;
 
-fn build_tree(dir: &Path, depth: usize, ancestors_are_last: &[bool]) -> Vec<TreeEntry> {
+fn build_tree(dir: &Path) -> Vec<TreeEntry> {
     let mut entries = Vec::new();
+    walk_tree(dir, 0, &[], &mut entries);
+    entries
+}
 
-    if depth >= MAX_TREE_DEPTH {
-        return entries;
+/// Append the tree under `dir` to `entries`, depth first, until it holds
+/// [`MAX_TREE_ENTRIES`].
+///
+/// The limit applies to `entries` as a whole. Checked against each
+/// directory's own entries instead, every subdirectory would get a budget of
+/// its own, and a tree of a few thousand directories holding a few thousand
+/// entries each would be walked in full twice a second.
+fn walk_tree(dir: &Path, depth: usize, ancestors_are_last: &[bool], entries: &mut Vec<TreeEntry>) {
+    let remaining = MAX_TREE_ENTRIES.saturating_sub(entries.len());
+    if depth >= MAX_TREE_DEPTH || remaining == 0 {
+        return;
     }
 
+    // Reading more than can still be shown would only be thrown away, and a
+    // single directory can hold any number of uploads. A directory that is
+    // cut short shows an arbitrary selection, still sorted.
     let mut children: Vec<_> = match std::fs::read_dir(dir) {
-        Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
-        Err(_) => return entries,
+        Ok(rd) => rd.filter_map(|e| e.ok()).take(remaining).collect(),
+        Err(_) => return,
     };
 
     // Sort: directories first, then alphabetical.
@@ -314,12 +330,9 @@ fn build_tree(dir: &Path, depth: usize, ancestors_are_last: &[bool]) -> Vec<Tree
         if is_dir {
             let mut child_ancestors = ancestors_are_last.to_vec();
             child_ancestors.push(is_last);
-            let sub = build_tree(&dir.join(&name), depth + 1, &child_ancestors);
-            entries.extend(sub);
+            walk_tree(&dir.join(&name), depth + 1, &child_ancestors, entries);
         }
     }
-
-    entries
 }
 
 fn format_tree_entry(entry: &TreeEntry) -> Line<'static> {
@@ -780,6 +793,21 @@ mod tests {
     fn interface_match_accepts_the_device_and_its_aliases() {
         assert!(interface_matches("eth0", "eth0"));
         assert!(interface_matches("eth0:1", "eth0"));
+    }
+
+    #[test]
+    fn the_tree_limit_covers_the_whole_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        // Each directory on its own is under the limit; together they are
+        // over it.
+        for sub in ["a", "b"] {
+            let sub = dir.path().join(sub);
+            std::fs::create_dir(&sub).unwrap();
+            for i in 0..3_000 {
+                std::fs::write(sub.join(format!("{i}.bin")), b"").unwrap();
+            }
+        }
+        assert_eq!(build_tree(dir.path()).len(), MAX_TREE_ENTRIES);
     }
 
     #[test]
