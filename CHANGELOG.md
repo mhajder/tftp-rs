@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.3](https://github.com/mhajder/tftp-rs/compare/v0.4.2...v0.4.3) (2026-11-01)
+
+
+### 🧩 CI
+
+* pin actions to commit SHAs at latest versions ([#44](https://github.com/mhajder/tftp-rs/issues/44)) ([f11e8e5](https://github.com/mhajder/tftp-rs/commit/f11e8e50f0747264a77595849adcb553d75a11ea))
+
 ## [0.4.2](https://github.com/mhajder/tftp-rs/compare/v0.4.1...v0.4.2) (2026-10-04)
 
 
