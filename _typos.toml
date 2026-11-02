@@ -1,0 +1,3 @@
+[default.extend-words]
+# Rust TUI crate
+ratatui = "ratatui"

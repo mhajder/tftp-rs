@@ -852,7 +852,7 @@ async fn run_inner(
                     Err(e) => {
                         let _ = tx.send(log_event(format!("{peer}: bad packet: {e}")));
                         // Say so, rather than leaving the client to retransmit
-                        // an unparseable request until its own timeout. The
+                        // an unparsable request until its own timeout. The
                         // budget keeps that from turning a well-known UDP port
                         // into an amplifier: the reply is longer than the two
                         // bytes needed to provoke it, and the source address

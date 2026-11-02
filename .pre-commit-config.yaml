@@ -28,6 +28,12 @@ repos:
       - id: check-added-large-files
         args: [ --maxkb=100 ]
 
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.51.1
+    hooks:
+      - id: typos
+        args: [ --hidden, --no-ignore, --force-exclude ]
+
   - repo: local
     hooks:
       - id: cargo-fmt
