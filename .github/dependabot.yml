@@ -16,3 +16,11 @@ updates:
       cargo-dependencies:
         patterns:
           - "*"
+  - package-ecosystem: "pre-commit"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      pre-commit-hooks:
+        patterns:
+          - "*"
