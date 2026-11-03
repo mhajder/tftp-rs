@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.3](https://github.com/mhajder/tftp-rs/compare/v0.4.2...v0.4.3) (2026-11-03)
+
+
+### 🧩 CI
+
+* add Dependabot updates for pre-commit hooks ([e9a47a0](https://github.com/mhajder/tftp-rs/commit/e9a47a058f31f69d1e0cc77ae907e077458c4d47))
+* pin actions to commit SHAs at latest versions ([#44](https://github.com/mhajder/tftp-rs/issues/44)) ([f11e8e5](https://github.com/mhajder/tftp-rs/commit/f11e8e50f0747264a77595849adcb553d75a11ea))
+* queue release runs so they never overlap ([4127cd6](https://github.com/mhajder/tftp-rs/commit/4127cd61350e4c888670aa16b5c1fcb4833f4704))
+
+
+### 📦 Build
+
+* add typos pre-commit hook ([b943f4c](https://github.com/mhajder/tftp-rs/commit/b943f4c8bcd63453a6b67333e54fdeae5710c173))
+
 ## [0.4.2](https://github.com/mhajder/tftp-rs/compare/v0.4.1...v0.4.2) (2026-10-04)
 
 
