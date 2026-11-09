@@ -2,13 +2,14 @@
 name = "tftp-rs"
 version = "0.4.2"
 edition = "2024"
-description = "A high-performance TFTP server with a TUI dashboard"
+description = "Async TFTP server with a live TUI dashboard, also embeddable as a tokio library: blksize, tsize, timeout and windowsize options (RFC 2347-2349, 7440), netascii and an optional HTTP file browser"
 license = "MIT"
 authors = ["Mateusz Hajder"]
 readme = "README.md"
 repository = "https://github.com/mhajder/tftp-rs"
-keywords = ["TFTP", "server", "TUI", "dashboard", "Rust"]
-categories = ["network-programming", "command-line-utilities"]
+documentation = "https://docs.rs/tftp-rs"
+keywords = ["tftp", "tftp-server", "tftpd", "pxe", "tui"]
+categories = ["network-programming", "command-line-utilities", "asynchronous"]
 
 [lib]
 name = "tftp_rs"
