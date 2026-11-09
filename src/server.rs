@@ -301,6 +301,17 @@ fn max_blksize() -> usize {
     *MAX_SENDABLE_BLKSIZE.get_or_init(detect_max_blksize)
 }
 
+/// The largest blksize the server will agree to: the OS limit, lowered to
+/// `config.max_block_size` when that is set.
+fn effective_max_blksize(config: &ServerConfig) -> usize {
+    let os_max = max_blksize();
+    if config.max_block_size > 0 {
+        config.max_block_size.min(os_max)
+    } else {
+        os_max
+    }
+}
+
 /// Maximum number of retries when the kernel returns ENOBUFS (macOS error 55)
 /// because the outgoing buffer is temporarily full.
 const ENOBUFS_MAX_RETRIES: u32 = 50;
@@ -579,19 +590,12 @@ fn negotiate_options(
     let mut timeout_ms = config.timeout_ms;
     let mut windowsize = DEFAULT_WINDOWSIZE;
 
-    let os_max = max_blksize();
-    let effective_max_blksize = if config.max_block_size > 0 {
-        config.max_block_size.min(os_max)
-    } else {
-        os_max
-    };
-
     // RFC 2348: blksize option.
     if let Some(val) = client_options.get("blksize")
         && let Ok(requested) = val.parse::<usize>()
         && (MIN_BLKSIZE..=MAX_BLKSIZE).contains(&requested)
     {
-        blksize = requested.min(effective_max_blksize);
+        blksize = requested.min(effective_max_blksize(config));
         acked.insert("blksize".to_string(), blksize.to_string());
     }
 
@@ -777,14 +781,9 @@ async fn run_inner(
     };
     let _ = tx.send(log_event(listener_description));
 
-    let detected_blksize = max_blksize();
-    let effective_max_blksize = if config.max_block_size > 0 {
-        config.max_block_size.min(detected_blksize)
-    } else {
-        detected_blksize
-    };
     let _ = tx.send(log_event(format!(
-        "Max negotiable blksize: {effective_max_blksize}"
+        "Max negotiable blksize: {}",
+        effective_max_blksize(&config)
     )));
     if config.max_window_size > 1 {
         let _ = tx.send(log_event(format!(
@@ -1308,11 +1307,7 @@ async fn handle_rrq(
             // the error has to come from it. RFC 1350 has the client discard
             // anything from an unknown transfer id, and a reply from a fresh
             // socket would be ignored and leave it waiting.
-            let error = Packet::ERROR {
-                code: 2,
-                msg: "Access violation".into(),
-            };
-            let _ = send_resilient(&sock, &error.to_bytes()).await;
+            send_transfer_error(&sock, 2, "Access violation").await;
             return Err(anyhow!("cannot open {}: {e}", path.display()));
         }
     };
@@ -1712,6 +1707,15 @@ async fn handle_wrq(
         .get("tsize")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
+    // What progress is measured against: the declared size when there is
+    // one, otherwise everything so far.
+    let report_total = |transferred: u64| {
+        if expected_size > 0 {
+            expected_size
+        } else {
+            transferred
+        }
+    };
 
     // A client that declares its size up front can be turned away before it
     // sends anything. One that does not is stopped mid-transfer instead, by
@@ -1968,15 +1972,10 @@ async fn handle_wrq(
                 send_resilient(&sock, &ack.to_bytes()).await?;
             }
 
-            let report_total = if expected_size > 0 {
-                expected_size
-            } else {
-                transferred
-            };
             let _ = tx.send(ServerEvent::TransferProgress {
                 id,
                 transferred,
-                total_bytes: report_total,
+                total_bytes: report_total(transferred),
             });
         }
     } else {
@@ -2067,15 +2066,10 @@ async fn handle_wrq(
             };
             send_resilient(&sock, &ack.to_bytes()).await?;
 
-            let report_total = if expected_size > 0 {
-                expected_size
-            } else {
-                transferred
-            };
             let _ = tx.send(ServerEvent::TransferProgress {
                 id,
                 transferred,
-                total_bytes: report_total,
+                total_bytes: report_total(transferred),
             });
 
             expected_block = expected_block.wrapping_add(1);
@@ -2117,11 +2111,7 @@ async fn handle_wrq(
                 drop(staging);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let error = Packet::ERROR {
-                    code: 6,
-                    msg: "File already exists".into(),
-                };
-                let _ = send_resilient(&sock, &error.to_bytes()).await;
+                send_transfer_error(&sock, 6, "File already exists").await;
                 return Err(anyhow!("file already exists: {}", path.display()));
             }
             Err(_) => {
@@ -2130,11 +2120,7 @@ async fn handle_wrq(
                 // make every upload fail on them, so fall back to a rename and
                 // accept that the existence check is no longer atomic.
                 if path.exists() {
-                    let error = Packet::ERROR {
-                        code: 6,
-                        msg: "File already exists".into(),
-                    };
-                    let _ = send_resilient(&sock, &error.to_bytes()).await;
+                    send_transfer_error(&sock, 6, "File already exists").await;
                     return Err(anyhow!("file already exists: {}", path.display()));
                 }
                 stored(&sock, &path, tokio::fs::rename(&part_path, &path).await).await?;
@@ -2153,11 +2139,7 @@ async fn handle_wrq(
     let _ = tx.send(ServerEvent::TransferProgress {
         id,
         transferred,
-        total_bytes: if expected_size > 0 {
-            expected_size
-        } else {
-            transferred
-        },
+        total_bytes: report_total(transferred),
     });
 
     let _ = tx.send(ServerEvent::TransferComplete(id));
@@ -2196,6 +2178,19 @@ async fn handle_wrq(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Tell the client on a transfer's own socket that the transfer has failed.
+///
+/// Once the client has exchanged packets with the transfer socket, RFC 1350
+/// has it discard anything arriving from anywhere else, so an error from a
+/// fresh socket would be ignored. Delivery is best effort.
+async fn send_transfer_error(sock: &UdpSocket, code: u16, message: &str) {
+    let error = Packet::ERROR {
+        code,
+        msg: message.into(),
+    };
+    let _ = send_resilient(sock, &error.to_bytes()).await;
+}
+
 /// Pass a file operation's result through, telling the client when it failed.
 ///
 /// The error goes out on the transfer's own socket, for the same reason as in
@@ -2205,11 +2200,7 @@ async fn stored<T>(sock: &UdpSocket, path: &Path, result: std::io::Result<T>) ->
         Ok(value) => Ok(value),
         Err(e) => {
             let (code, message) = file_error_reply(&e);
-            let error = Packet::ERROR {
-                code,
-                msg: message.into(),
-            };
-            let _ = send_resilient(sock, &error.to_bytes()).await;
+            send_transfer_error(sock, code, message).await;
             Err(anyhow!("cannot store {}: {e}", path.display()))
         }
     }
@@ -2225,11 +2216,7 @@ async fn refuse_oversized_upload(sock: &UdpSocket, transferred: u64, limit: u64)
     if limit == 0 || transferred <= limit {
         return Ok(());
     }
-    let error = Packet::ERROR {
-        code: 3,
-        msg: "Disk full or allocation exceeded".into(),
-    };
-    let _ = send_resilient(sock, &error.to_bytes()).await;
+    send_transfer_error(sock, 3, "Disk full or allocation exceeded").await;
     Err(anyhow!("upload exceeded the {limit} byte limit"))
 }
 

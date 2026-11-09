@@ -14,6 +14,8 @@ use tokio_util::io::ReaderStream;
 
 use tftp_rs::server::{ServerEvent, is_upload_staging_name, sanitize_path, single_line};
 
+use crate::ui::{human_bytes, sort_dirs_first};
+
 struct HttpState {
     dir: PathBuf,
     tx: mpsc::UnboundedSender<ServerEvent>,
@@ -167,17 +169,7 @@ async fn listing_response(dir: PathBuf, display_path: String) -> Response {
 fn render_directory(dir: &Path, display_path: &str) -> std::io::Result<String> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
 
-    // Sort: directories first, then alphabetical.
-    entries.sort_by(|a, b| {
-        let a_dir = a.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-        let b_dir = b.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-        b_dir.cmp(&a_dir).then_with(|| {
-            a.file_name()
-                .to_string_lossy()
-                .to_lowercase()
-                .cmp(&b.file_name().to_string_lossy().to_lowercase())
-        })
-    });
+    sort_dirs_first(&mut entries);
 
     let mut html = String::new();
     html.push_str("<!DOCTYPE html><html><head><meta charset=\"utf-8\">");
@@ -345,21 +337,6 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&result).to_string()
-}
-
-fn human_bytes(b: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-    if b >= GB {
-        format!("{:.1} GB", b as f64 / GB as f64)
-    } else if b >= MB {
-        format!("{:.1} MB", b as f64 / MB as f64)
-    } else if b >= KB {
-        format!("{:.1} KB", b as f64 / KB as f64)
-    } else {
-        format!("{b} B")
-    }
 }
 
 #[cfg(test)]

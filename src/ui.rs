@@ -292,17 +292,7 @@ fn walk_tree(dir: &Path, depth: usize, ancestors_are_last: &[bool], entries: &mu
         Err(_) => return,
     };
 
-    // Sort: directories first, then alphabetical.
-    children.sort_by(|a, b| {
-        let a_dir = a.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-        let b_dir = b.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-        b_dir.cmp(&a_dir).then_with(|| {
-            a.file_name()
-                .to_string_lossy()
-                .to_lowercase()
-                .cmp(&b.file_name().to_string_lossy().to_lowercase())
-        })
-    });
+    sort_dirs_first(&mut children);
 
     let count = children.len();
     for (i, entry) in children.into_iter().enumerate() {
@@ -770,7 +760,19 @@ fn draw_quit_dialog(f: &mut Frame, selected_yes: bool) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn human_bytes(b: u64) -> String {
+/// Sort directory entries directories first, then by name ignoring case.
+///
+/// Each entry's key is worked out once. A comparator would look up both file
+/// types and lowercase both names on every comparison, and the dashboard sorts
+/// up to [`MAX_TREE_ENTRIES`] entries twice a second.
+pub(crate) fn sort_dirs_first(entries: &mut [std::fs::DirEntry]) {
+    entries.sort_by_cached_key(|entry| {
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        (!is_dir, entry.file_name().to_string_lossy().to_lowercase())
+    });
+}
+
+pub(crate) fn human_bytes(b: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
     const GB: u64 = 1024 * MB;
