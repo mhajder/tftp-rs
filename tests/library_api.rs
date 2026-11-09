@@ -3,7 +3,9 @@ use std::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use tftp_rs::server::run_on_interface;
-use tftp_rs::server::{ServerConfig, ServerEvent, probe_bind, run, validate_bind_addr};
+use tftp_rs::server::{
+    ServerConfig, ServerEvent, bind_tcp_listener, probe_bind, run, validate_bind_addr,
+};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 
@@ -324,6 +326,51 @@ async fn probe_bind_rejects_a_missing_interface() {
         error.to_string().contains("was not found"),
         "unexpected error: {error}"
     );
+}
+
+/// Accept one connection on a listener from `bind_tcp_listener`, which also
+/// proves it is non-blocking: tokio refuses nothing else.
+async fn accepts_a_connection(listener: std::net::TcpListener) {
+    let address = listener.local_addr().expect("listener address");
+    let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+    let (connected, accepted) =
+        tokio::join!(tokio::net::TcpStream::connect(address), listener.accept());
+    connected.expect("connect");
+    accepted.expect("accept");
+}
+
+#[tokio::test]
+async fn bind_tcp_listener_gives_a_listener_tokio_can_serve() {
+    let listener =
+        bind_tcp_listener(SocketAddr::from(([127, 0, 0, 1], 0)), None).expect("listener");
+    accepts_a_connection(listener).await;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn bind_tcp_listener_binds_to_a_named_interface() {
+    let listener = bind_tcp_listener(
+        SocketAddr::from(([127, 0, 0, 1], 0)),
+        Some(LOOPBACK_INTERFACE),
+    )
+    .expect("interface-bound listener");
+    accepts_a_connection(listener).await;
+}
+
+#[test]
+fn bind_tcp_listener_rejects_a_missing_interface() {
+    bind_tcp_listener(
+        SocketAddr::from(([127, 0, 0, 1], 0)),
+        Some("tftp-rs-no-such-if"),
+    )
+    .expect_err("an unknown interface must never fall back to every interface");
+}
+
+#[test]
+fn bind_tcp_listener_reports_an_address_in_use() {
+    let first = bind_tcp_listener(SocketAddr::from(([127, 0, 0, 1], 0)), None).expect("listener");
+    let taken = first.local_addr().expect("listener address");
+    bind_tcp_listener(taken, None).expect_err("the address is already taken");
 }
 
 #[tokio::test]

@@ -1127,19 +1127,13 @@ async fn run_inner(
                 };
                 let tx2 = tx.clone();
                 tokio::spawn(async move {
-                    // The handler runs as a task of its own so that a panic
-                    // in it ends here as an error. Otherwise a started
-                    // transfer would never be reported as finished, and
-                    // whoever watches the events would show it forever.
-                    let handler = tokio::spawn(async move {
+                    let result = run_catching_panics(async move {
                         match kind {
                             TransferKind::Download => handle_rrq(ctx, &filename, &mode, &options).await,
                             TransferKind::Upload => handle_wrq(ctx, &filename, &mode, &options).await,
                         }
-                    });
-                    let result = handler
-                        .await
-                        .unwrap_or_else(|e| Err(anyhow!("internal error: {e}")));
+                    })
+                    .await;
                     drop(in_progress);
                     drop(slot);
                     if let Err(e) = result {
@@ -1160,6 +1154,21 @@ async fn run_inner(
         }
     }
     Ok(())
+}
+
+/// Run a transfer handler as a task of its own, turning a panic in it into an
+/// error.
+///
+/// Without this a panicking handler would end its task silently: a started
+/// transfer would never be reported as finished, and whoever watches the
+/// events would show it as running forever.
+async fn run_catching_panics<F>(handler: F) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    tokio::spawn(handler)
+        .await
+        .unwrap_or_else(|e| Err(anyhow!("internal error: {e}")))
 }
 
 /// A peer's entry in the set of transfers in progress, released on drop.
@@ -2591,6 +2600,27 @@ pub fn sanitize_path(dir: &Path, filename: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_panicking_handler_comes_back_as_an_error() {
+        let error = run_catching_panics(async { panic!("handler blew up") })
+            .await
+            .expect_err("a panic must become an error");
+        let message = error.to_string();
+        assert!(message.starts_with("internal error:"), "{message}");
+        assert!(message.contains("handler blew up"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_handler_result_passes_through_unchanged() {
+        run_catching_panics(async { Ok(()) })
+            .await
+            .expect("success passes through");
+        let error = run_catching_panics(async { Err(anyhow!("file not found")) })
+            .await
+            .expect_err("errors pass through");
+        assert_eq!(error.to_string(), "file not found");
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
