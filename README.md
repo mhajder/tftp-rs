@@ -94,6 +94,15 @@ Download a pre-built binary for your platform from the [latest release](https://
 | macOS    | Intel (`x86_64-apple-darwin`) and Apple Silicon (`aarch64-apple-darwin`)     |
 | Windows  | `x86_64` and `aarch64` (`-pc-windows-msvc`, `.zip`)                          |
 
+Each release also has a `SHA256SUMS` file and a build provenance attestation,
+so you can check that a download is intact and was built by this repository's
+release workflow:
+
+```bash
+sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify tftp-rs-<version>-<target>.tar.gz --repo mhajder/tftp-rs
+```
+
 ### From source
 
 ```bash
