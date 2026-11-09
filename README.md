@@ -1,49 +1,98 @@
+<div align="center">
+
 # tftp-rs
 
-An embeddable asynchronous TFTP server and a companion TUI binary. It
+**A fast, single-binary TFTP server with a live terminal dashboard, also usable as an embeddable async library**
+
+[![Crates.io](https://img.shields.io/crates/v/tftp-rs?logo=rust&logoColor=white)](https://crates.io/crates/tftp-rs)
+[![docs.rs](https://img.shields.io/docsrs/tftp-rs?logo=docsdotrs)](https://docs.rs/tftp-rs)
+[![Release](https://img.shields.io/github/v/release/mhajder/tftp-rs?logo=github)](https://github.com/mhajder/tftp-rs/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/mhajder/tftp-rs/total?logo=github)](https://github.com/mhajder/tftp-rs/releases)
+[![License](https://img.shields.io/github/license/mhajder/tftp-rs)](https://github.com/mhajder/tftp-rs/blob/main/LICENSE)
+
+[![CI](https://github.com/mhajder/tftp-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mhajder/tftp-rs/actions/workflows/ci.yml)
+[![Rust](https://img.shields.io/badge/Rust-2024_edition-CE422B?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Platforms](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-555)](https://github.com/mhajder/tftp-rs#-installation)
+[![RFCs](https://img.shields.io/badge/RFC-1350%20%7C%202347%20%7C%202348%20%7C%202349%20%7C%207440-2EC4C4)](https://github.com/mhajder/tftp-rs#-implemented-rfcs)
+[![Stars](https://img.shields.io/github/stars/mhajder/tftp-rs?style=flat&logo=github)](https://github.com/mhajder/tftp-rs/stargazers)
+
+[Installation](https://github.com/mhajder/tftp-rs#-installation) · [Usage](https://github.com/mhajder/tftp-rs#-usage) · [Library](https://github.com/mhajder/tftp-rs#-library) · [Architecture](https://github.com/mhajder/tftp-rs#-architecture) · [Contributing](https://github.com/mhajder/tftp-rs#-contributing)
+
+</div>
+
+tftp-rs is an embeddable asynchronous TFTP server and a companion TUI binary. It
 implements the TFTP protocol from scratch with full support for both Read
 (RRQ) and Write (WRQ) operations, RFC option negotiation (blksize, timeout,
-tsize, windowsize), netascii mode, and an optional HTTP file server.
+tsize, windowsize), netascii mode, and an optional HTTP file server. It is
+built for the everyday network-engineering job of pushing firmware and configs
+to switches, routers and PXE clients, and showing you exactly what is happening
+while it does.
 
-## Implemented RFCs
+![tftp-rs dashboard](./.github/screenshot.png)
 
-| RFC | Description |
-|-----|-------------|
-| [RFC 1350](https://www.rfc-editor.org/rfc/rfc1350) | The TFTP Protocol (Revision 2) |
-| [RFC 2347](https://www.rfc-editor.org/rfc/rfc2347) | TFTP Option Extension |
-| [RFC 2348](https://www.rfc-editor.org/rfc/rfc2348) | TFTP Blocksize Option |
+## ✨ Features
+
+### Protocol
+
+- **RFC 1350 compliant**: hand-rolled TFTP protocol, no external TFTP crates
+- **RFC 2347/2348 option negotiation**: blksize up to 65,464 bytes; capped via `--max-block-size` for VPN environments
+- **RFC 2349 timeout + tsize**: clients can negotiate a custom reply timeout; tsize reports file size on octet downloads and is echoed on uploads (a netascii download sends more bytes than the file holds, so tsize is left unacknowledged there)
+- **RFC 7440 windowsize**: windowed transfers send multiple DATA blocks before waiting for ACK, significantly improving throughput on high-latency links
+- **Netascii mode**: full bidirectional conversion (`\n` ↔ `\r\n`, `\r` ↔ `\r\0`) across block boundaries for legacy clients
+- **Unlimited transfer size**: block numbers roll over correctly (u16 wrap-around), enabling files larger than 32 MB with the default 512-byte block size
+
+### Transfers
+
+- **Full RRQ + WRQ**: serve files to clients (download) and receive files from clients (upload); an upload is staged as `<name>.<transfer id>.part` and renamed into place once complete, and no client can read or write a staging file by name (names of the form `<name>.<number>.part`, in any letter case, are reserved for this)
+- **Subdirectory support**: read and write files in nested directories (e.g. `ios/config/router.cfg`)
+- **Async I/O**: built on `tokio` with non-blocking UDP sockets
+- **Ephemeral transfer sockets**: each transfer gets its own OS-assigned port, keeping the main listener free
+- **Request deduplication**: duplicate requests from the same peer are silently dropped while a transfer is already in progress
+- **Configurable retransmission**: `--timeout` (ms) and `--max-retries` to tune behaviour for unstable networks
+
+### Safety & limits
+
+- **Path sanitization**: prevents directory traversal attacks
+- **Overwrite protection**: WRQ for existing files can be rejected with `--allow-overwrite false` (returns error code 6)
+- **Access control**: `--disable-read` or `--disable-write` to restrict what operations clients may perform (`--disable-read` refuses to run alongside `--http-port`, which would hand out the same files anyway)
+- **Resource limits**: `--max-concurrent-transfers` (default 256) bounds the sockets and open files unanswered requests can tie up; `--max-upload-size` caps what a single upload may write (off by default)
+- **Interface pinning**: `--interface` binds every socket to one network device on Linux and macOS, and fails instead of falling back to an unbound socket
+
+### Dashboard & extras
+
+- **TUI dashboard**: real-time view of server status, shared files tree, active transfers with progress bars, and timestamped scrollable logs
+- **Interface discovery**: with a wildcard bind, displays the host's non-loopback addresses in the header (IPv4 for `0.0.0.0`, IPv4 and IPv6 for `::`) and refreshes them every 10 seconds; adding `--interface` narrows that to the named device's addresses, loopback included, because those are the ones the server answers on; with an explicit `--bind` it shows the one address in use
+- **Scrollable panels**: Tab to cycle focus between Shared Files, Active Transfers, and Logs panels; Up/Down to scroll
+- **HTTP file server**: optional HTTP server for browser-based directory browsing and file downloads (`--http-port`); uploads still in progress are neither listed nor served
+- **Log file export**: optionally write all logs to a file with `--log-file`
+
+## 📡 Implemented RFCs
+
+| RFC                                                | Description                                     |
+|----------------------------------------------------|-------------------------------------------------|
+| [RFC 1350](https://www.rfc-editor.org/rfc/rfc1350) | The TFTP Protocol (Revision 2)                  |
+| [RFC 2347](https://www.rfc-editor.org/rfc/rfc2347) | TFTP Option Extension                           |
+| [RFC 2348](https://www.rfc-editor.org/rfc/rfc2348) | TFTP Blocksize Option                           |
 | [RFC 2349](https://www.rfc-editor.org/rfc/rfc2349) | TFTP Timeout Interval and Transfer Size Options |
-| [RFC 7440](https://www.rfc-editor.org/rfc/rfc7440) | TFTP Windowsize Option |
+| [RFC 7440](https://www.rfc-editor.org/rfc/rfc7440) | TFTP Windowsize Option                          |
 
-## Features
+## 📦 Installation
 
-- **RFC 1350 compliant** -- hand-rolled TFTP protocol, no external TFTP crates
-- **RFC 2347/2348 option negotiation** -- blksize up to 65,464 bytes; capped via `--max-block-size` for VPN environments
-- **RFC 2349 timeout + tsize** -- clients can negotiate a custom reply timeout; tsize reports file size on octet downloads and is echoed on uploads (a netascii download sends more bytes than the file holds, so tsize is left unacknowledged there)
-- **RFC 7440 windowsize** -- windowed transfers send multiple DATA blocks before waiting for ACK, significantly improving throughput on high-latency links
-- **Netascii mode** -- full bidirectional conversion (`\n` ↔ `\r\n`, `\r` ↔ `\r\0`) across block boundaries for legacy clients
-- **Unlimited transfer size** -- block numbers roll over correctly (u16 wrap-around), enabling files larger than 32 MB with the default 512-byte block size
-- **Full RRQ + WRQ** -- serve files to clients (download) and receive files from clients (upload); an upload is staged as `<name>.<transfer id>.part` and renamed into place once complete, and no client can read or write a staging file by name (names of the form `<name>.<number>.part`, in any letter case, are reserved for this)
-- **Subdirectory support** -- read and write files in nested directories (e.g. `ios/config/router.cfg`)
-- **Async I/O** -- built on `tokio` with non-blocking UDP sockets
-- **Ephemeral transfer sockets** -- each transfer gets its own OS-assigned port, keeping the main listener free
-- **Request deduplication** -- duplicate requests from the same peer are silently dropped while a transfer is already in progress
-- **Overwrite protection** -- WRQ for existing files can be rejected with `--allow-overwrite false` (returns error code 6)
-- **Access control** -- `--disable-read` or `--disable-write` to restrict what operations clients may perform (`--disable-read` refuses to run alongside `--http-port`, which would hand out the same files anyway)
-- **Configurable retransmission** -- `--timeout` (ms) and `--max-retries` to tune behaviour for unstable networks
-- **Resource limits** -- `--max-concurrent-transfers` (default 256) bounds the sockets and open files unanswered requests can tie up; `--max-upload-size` caps what a single upload may write (off by default)
-- **HTTP file server** -- optional HTTP server for browser-based directory browsing and file downloads (`--http-port`); uploads still in progress are neither listed nor served
-- **TUI dashboard** -- real-time view of server status, shared files tree, active transfers with progress bars, and timestamped scrollable logs
-- **Interface discovery** -- with the default wildcard bind, displays the host's non-loopback IPv4 addresses in the header (auto-refreshes every 10 seconds); adding `--interface` narrows that to the named device's IPv4 addresses, loopback included, because those are the ones the server answers on; with an explicit `--bind` it shows the one address in use
-- **Scrollable panels** -- Tab to cycle focus between Shared Files, Active Transfers, and Logs panels; Up/Down to scroll
-- **Log file export** -- optionally write all logs to a file with `--log-file`
-- **Path sanitization** -- prevents directory traversal attacks
+### From crates.io
 
-## Screenshot
+```bash
+cargo install tftp-rs
+```
 
-![Screenshot](./.github/screenshot.png)
+### From GitHub Releases
 
-## Installation
+Download a pre-built binary for your platform from the [latest release](https://github.com/mhajder/tftp-rs/releases/latest):
+
+| Platform | Archive                                                                      |
+|----------|------------------------------------------------------------------------------|
+| Linux    | `x86_64` / `aarch64`, glibc (`-unknown-linux-gnu`) or static musl (`-unknown-linux-musl`) |
+| macOS    | Intel (`x86_64-apple-darwin`) and Apple Silicon (`aarch64-apple-darwin`)     |
+| Windows  | `x86_64` and `aarch64` (`-pc-windows-msvc`, `.zip`)                          |
 
 ### From source
 
@@ -55,11 +104,11 @@ cargo build --release
 
 The binary will be at `target/release/tftp-rs`.
 
-### From GitHub Releases
+> [!NOTE]
+> Port 69 is privileged. Run tftp-rs as root, grant it `CAP_NET_BIND_SERVICE` on Linux
+> (`sudo setcap cap_net_bind_service=+ep "$(which tftp-rs)"`), or pick a port above 1024 with `-p`.
 
-Download a pre-built binary for your platform from the [Releases](https://github.com/mhajder/tftp-rs/releases) page.
-
-## Usage
+## 🚀 Usage
 
 ```bash
 # Serve the current directory on port 69 (default), on every interface
@@ -99,98 +148,35 @@ tftp-rs -p 69 -d /srv/tftp -l /var/log/tftp.log --http-port 8080 -w 4 -t 200
 
 ### CLI Options
 
-```
+```text
 Options:
       --bind <BIND>                    Local IP address to bind [default: 0.0.0.0]
       --interface <INTERFACE>          Bind every socket to this network interface (Linux/macOS)
-  -p, --port <PORT>                  UDP port to listen on [default: 69]
-  -d, --dir <DIR>                    Directory to serve / receive files [default: .]
-  -l, --log-file <LOG_FILE>          Optional file path to write logs to
-      --http-port <PORT>             Enable HTTP file server on the specified port
-  -t, --timeout <MS>                 Reply timeout in milliseconds, at least 1 [default: 500]
-      --max-block-size <BYTES>       Max negotiable blksize, 0 or at least 8 (0 = OS auto-detect) [default: 0]
-  -w, --max-window-size <N>          Max RFC 7440 window size (1 = disable) [default: 1]
-      --allow-overwrite <BOOL>       Allow overwriting existing files on WRQ [default: true]
-      --max-retries <N>              Max retransmission attempts [default: 10]
-      --max-concurrent-transfers <N> Transfers in flight at once (0 = unlimited) [default: 256]
-      --max-upload-size <BYTES>      Reject an upload past this size (0 = unlimited) [default: 0]
-      --disable-read                 Reject all RRQ (download) requests
-      --disable-write                Reject all WRQ (upload) requests
-  -h, --help                         Print help
-  -V, --version                      Print version
+  -p, --port <PORT>                    UDP port to listen on [default: 69]
+  -d, --dir <DIR>                      Directory to serve / receive files [default: .]
+  -l, --log-file <LOG_FILE>            Optional file path to write logs to
+      --http-port <PORT>               Enable HTTP file server on the specified port
+  -t, --timeout <MS>                   Reply timeout in milliseconds, at least 1 [default: 500]
+      --max-block-size <BYTES>         Max negotiable blksize, 0 or at least 8 (0 = OS auto-detect) [default: 0]
+  -w, --max-window-size <N>            Max RFC 7440 window size (1 = disable) [default: 1]
+      --allow-overwrite <BOOL>         Allow overwriting existing files on WRQ [default: true]
+      --max-retries <N>                Max retransmission attempts [default: 10]
+      --max-concurrent-transfers <N>   Transfers in flight at once (0 = unlimited) [default: 256]
+      --max-upload-size <BYTES>        Reject an upload past this size (0 = unlimited) [default: 0]
+      --disable-read                   Reject all RRQ (download) requests
+      --disable-write                  Reject all WRQ (upload) requests
+  -h, --help                           Print help
+  -V, --version                        Print version
 ```
 
 Each TFTP transfer reuses the listener's local address and only makes its UDP
 port ephemeral. With the default wildcard bind the operating system picks the
-source address per reply, as before. Passing an explicit `--bind` address
-guarantees replies leave from the address the client contacted, which is what
-multi-homed hosts and VPN setups need. Embedders can enforce that with
+source address per reply. Passing an explicit `--bind` address guarantees
+replies leave from the address the client contacted, which is what multi-homed
+hosts and VPN setups need. Embedders can enforce that with
 `server::validate_bind_addr`.
 
-## Library
-
-The package also exports a `tftp_rs` library target. The caller owns the
-explicit local bind address and shutdown lifecycle:
-
-```rust,no_run
-use std::net::SocketAddr;
-
-use tftp_rs::server::{run, ServerConfig, ServerEvent};
-use tokio::sync::{mpsc, watch};
-
-# async fn example() -> anyhow::Result<()> {
-let bind: SocketAddr = "192.0.2.1:69".parse()?;
-let (events, _event_rx) = mpsc::unbounded_channel::<ServerEvent>();
-let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-run(bind, "/srv/tftp".into(), events, shutdown_rx, ServerConfig::default()).await?;
-# Ok(())
-# }
-```
-
-`events` carries progress and log messages for a caller that wants to show
-them. It is not part of the transfer path: drop the receiver and the events
-stop, while the server goes on serving files and still shuts down cleanly. A
-caller that wants none of them can drop it straight away.
-
-For a service that must remain on one macOS or Linux interface, use
-`run_on_interface`. It applies the OS interface binding to the listener,
-temporary error replies, and every ephemeral TFTP transfer socket; it fails
-instead of falling back to an unbound socket. A wildcard address is accepted
-here, because the interface binding already scopes the service:
-
-```rust,no_run
-use std::net::SocketAddr;
-
-use tftp_rs::server::{run_on_interface, ServerConfig, ServerEvent};
-use tokio::sync::{mpsc, watch};
-
-# async fn example() -> anyhow::Result<()> {
-let bind: SocketAddr = "192.0.2.1:69".parse()?;
-let (events, _event_rx) = mpsc::unbounded_channel::<ServerEvent>();
-let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-run_on_interface(
-    bind,
-    "en7",
-    "/srv/tftp".into(),
-    events,
-    shutdown_rx,
-    ServerConfig::default(),
-)
-.await?;
-# Ok(())
-# }
-```
-
-On Linux this needs no `CAP_NET_RAW`. The kernel requires that capability
-only when a socket is re-bound to a different device, and each socket here
-is created and bound once. Serving the default port 69 still needs root or
-`CAP_NET_BIND_SERVICE`.
-
-The TUI binary remains the default Cargo feature. Embedders can avoid its
-dashboard and HTTP dependencies with `tftp-rs = { default-features = false,
-... }`.
-
-### TUI Controls
+### 🎮 TUI Controls
 
 | Key                      | Action                           |
 |--------------------------|----------------------------------|
@@ -205,7 +191,7 @@ dashboard and HTTP dependencies with `tftp-rs = { default-features = false,
 While the quit dialog is open it takes every key, so `Tab` toggles the
 selection there rather than cycling panels.
 
-### Testing with a TFTP client
+### 🧪 Testing with a TFTP client
 
 ```bash
 # Download a file from the server
@@ -225,9 +211,76 @@ tftp localhost 69
 > put configs/new_config.cfg
 ```
 
-## Architecture
+## 📚 Library
 
+The package also exports a `tftp_rs` library target. The caller owns the
+explicit local bind address and shutdown lifecycle:
+
+```rust
+use std::net::SocketAddr;
+
+use tftp_rs::server::{run, ServerConfig, ServerEvent};
+use tokio::sync::{mpsc, watch};
+
+async fn example() -> anyhow::Result<()> {
+    let bind: SocketAddr = "192.0.2.1:69".parse()?;
+    let (events, _event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    run(bind, "/srv/tftp".into(), events, shutdown_rx, ServerConfig::default()).await?;
+    Ok(())
+}
 ```
+
+`events` carries progress and log messages for a caller that wants to show
+them. It is not part of the transfer path: drop the receiver and the events
+stop, while the server goes on serving files and still shuts down cleanly. A
+caller that wants none of them can drop it straight away.
+
+For a service that must remain on one macOS or Linux interface, use
+`run_on_interface`. It applies the OS interface binding to the listener,
+temporary error replies, and every ephemeral TFTP transfer socket; it fails
+instead of falling back to an unbound socket. A wildcard address is accepted
+here, because the interface binding already scopes the service:
+
+```rust
+use std::net::SocketAddr;
+
+use tftp_rs::server::{run_on_interface, ServerConfig, ServerEvent};
+use tokio::sync::{mpsc, watch};
+
+async fn example() -> anyhow::Result<()> {
+    let bind: SocketAddr = "192.0.2.1:69".parse()?;
+    let (events, _event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    run_on_interface(
+        bind,
+        "en7",
+        "/srv/tftp".into(),
+        events,
+        shutdown_rx,
+        ServerConfig::default(),
+    )
+    .await?;
+    Ok(())
+}
+```
+
+On Linux this needs no `CAP_NET_RAW`. The kernel requires that capability
+only when a socket is re-bound to a different device, and each socket here
+is created and bound once. Serving the default port 69 still needs root or
+`CAP_NET_BIND_SERVICE`.
+
+The TUI binary is the default Cargo feature. Embedders can skip its dashboard
+and HTTP dependencies:
+
+```toml
+[dependencies]
+tftp-rs = { version = "0.4", default-features = false }
+```
+
+## 🧱 Architecture
+
+```text
 src/
   lib.rs               Embeddable library crate
   main.rs              Companion server binary, CLI args (clap), TUI event loop
@@ -249,24 +302,24 @@ tests/
 
 All TFTP packet types are manually parsed and serialized with Big-Endian byte order:
 
-| Opcode | Type  | Description                                  |
-|--------|-------|----------------------------------------------|
-| 1      | RRQ   | Read request (client download)               |
-| 2      | WRQ   | Write request (client upload)                |
-| 3      | DATA  | Data payload (up to 65,464-byte blocks)      |
-| 4      | ACK   | Acknowledgment                               |
-| 5      | ERROR | Error notification                           |
-| 6      | OACK  | Option acknowledgment (RFC 2347)             |
+| Opcode | Type  | Description                             |
+|--------|-------|-----------------------------------------|
+| 1      | RRQ   | Read request (client download)          |
+| 2      | WRQ   | Write request (client upload)           |
+| 3      | DATA  | Data payload (up to 65,464-byte blocks) |
+| 4      | ACK   | Acknowledgment                          |
+| 5      | ERROR | Error notification                      |
+| 6      | OACK  | Option acknowledgment (RFC 2347)        |
 
 ### Option Negotiation
 
 When a client includes options in its RRQ/WRQ request, the server responds with an OACK packet acknowledging the negotiated values before data transfer begins.
 
-| Option | RFC | Description |
-|--------|-----|-------------|
-| `blksize` | 2348 | Block payload size, 8–65,464 bytes (default 512). Capped by `--max-block-size` and OS UDP limit. |
-| `timeout` | 2349 | Per-transfer reply timeout in seconds (1–255). Overrides the server default for that transfer. |
-| `tsize` | 2349 | On octet RRQ: server reports the file size. On netascii RRQ: left unacknowledged, since the encoded transfer is longer than the file on disk. On WRQ: server echoes back the client's value. |
+| Option       | RFC  | Description |
+|--------------|------|-------------|
+| `blksize`    | 2348 | Block payload size, 8–65,464 bytes (default 512). Capped by `--max-block-size` and OS UDP limit. |
+| `timeout`    | 2349 | Per-transfer reply timeout in seconds (1–255). Overrides the server default for that transfer. |
+| `tsize`      | 2349 | On octet RRQ: server reports the file size. On netascii RRQ: left unacknowledged, since the encoded transfer is longer than the file on disk. On WRQ: server echoes back the client's value. |
 | `windowsize` | 7440 | Number of DATA blocks sent before waiting for an ACK. Capped by `--max-window-size`. |
 
 ### Windowed Transfer (RFC 7440)
@@ -276,6 +329,7 @@ With `--max-window-size N` (N > 1), the server sends up to N DATA blocks before 
 ### Netascii Mode
 
 The server fully supports the `netascii` transfer mode:
+
 - **Download (RRQ):** binary data is encoded on the fly (`\n` → `\r\n`, `\r` → `\r\0`) with overflow tracking across block boundaries.
 - **Upload (WRQ):** incoming netascii data is decoded to binary (`\r\n` → `\n`, `\r\0` → `\r`) with carry-over state for `\r` spanning two consecutive blocks.
 
@@ -283,18 +337,24 @@ The server fully supports the `netascii` transfer mode:
 
 Block numbers are 16-bit unsigned integers. The server uses `wrapping_add(1)` on every block increment, enabling files of unlimited size with any block size (e.g. a file larger than 32 MB with the default 512-byte blksize requires block numbers to wrap past 65535).
 
-## Tech Stack
+## 🧰 Tech Stack
 
 - **Rust** 2024 edition
-- **tokio** -- async UDP and TCP I/O
-- **socket2** -- interface-bound sockets and per-transfer buffer sizing
-- **libc** -- interface name lookup on Linux and macOS
-- **ratatui** + **crossterm** -- terminal UI
-- **axum** + **tokio-util** -- HTTP file server and streamed file bodies
-- **clap** -- CLI argument parsing
-- **anyhow** -- error handling
-- **if-addrs** -- network interface discovery
+- **tokio**: async UDP and TCP I/O
+- **socket2**: interface-bound sockets and per-transfer buffer sizing
+- **libc**: interface name lookup on Linux and macOS
+- **ratatui** + **crossterm**: terminal UI
+- **axum** + **tokio-util**: HTTP file server and streamed file bodies
+- **clap**: CLI argument parsing
+- **anyhow**: error handling
+- **if-addrs**: network interface discovery
 
-## License
+## 🤝 Contributing
 
-MIT
+Issues and pull requests are welcome. See [CONTRIBUTING.md](https://github.com/mhajder/tftp-rs/blob/main/CONTRIBUTING.md) for the dev setup, checks and commit message format, and use the [issue templates](https://github.com/mhajder/tftp-rs/issues/new/choose) for bugs and feature requests.
+
+Found a security problem? Please report it privately as described in [SECURITY.md](https://github.com/mhajder/tftp-rs/blob/main/SECURITY.md).
+
+## 📜 License
+
+This project is licensed under the MIT License - see the [LICENSE](https://github.com/mhajder/tftp-rs/blob/main/LICENSE) file for details.

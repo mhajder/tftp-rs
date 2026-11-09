@@ -1,0 +1,67 @@
+name: Bug report
+description: tftp-rs does not work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For security issues, use [private vulnerability reporting](https://github.com/mhajder/tftp-rs/security/advisories/new) instead of a public issue.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: Command you ran
+      description: The full tftp-rs command line, or the `ServerConfig` if you use the library.
+      placeholder: tftp-rs -p 69 -d /srv/tftp -w 4 --http-port 8080
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: tftp-rs version
+      description: The output of `tftp-rs --version`, or the crate version.
+      placeholder: e.g. 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it?
+      options:
+        - GitHub Releases binary
+        - cargo install (crates.io)
+        - Built from source
+        - Used as a library
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: OS
+      options:
+        - Linux x64
+        - Linux ARM64
+        - macOS Apple Silicon (ARM64)
+        - macOS Intel (x64)
+        - Windows x64
+        - Windows ARM64
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: TFTP client
+      description: The client or device on the other end, and the options it asked for if you know them.
+      placeholder: e.g. Cisco IOS-XE 17.9 copy tftp:, curl 8.10, atftp with blksize 1468
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The relevant lines from the dashboard or the `--log-file`, including any errors.
+      render: text
