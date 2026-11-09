@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.4.3](https://github.com/mhajder/tftp-rs/compare/v0.4.2...v0.4.3) (2026-11-09)
+
+
+### 🐛 Bug Fixes
+
+* harden listener logging, reply budget and peer tracking ([28cc54b](https://github.com/mhajder/tftp-rs/commit/28cc54b1851736bea9a1bf2c0670deb8d171bb83))
+* report panicked transfers and stop on a shutdown receiver that already reads true ([76ee366](https://github.com/mhajder/tftp-rs/commit/76ee3663ccca99531a4fae1bd6c5a2855daf399d))
+
+
+### 🧹 Refactoring
+
+* share formatting and error-reply helpers ([a691eff](https://github.com/mhajder/tftp-rs/commit/a691effcf1c57488a63ed86c7a593178e238c00a))
+
+
+### 📚 Documentation
+
+* document the library API and examples for docs.rs ([228f844](https://github.com/mhajder/tftp-rs/commit/228f844301ca2eb26c4d8a56f322cc8df1dbca80))
+* point the README library section to docs.rs ([d41657b](https://github.com/mhajder/tftp-rs/commit/d41657b40f639de664473f442559366cd05e153d))
+* restyle README and add contributing guide, security policy and issue templates ([baba74c](https://github.com/mhajder/tftp-rs/commit/baba74c2081f9d888416bb4ecd6925d0b6ce81af))
+
+
+### 🧩 CI
+
+* add Dependabot updates for pre-commit hooks ([e9a47a0](https://github.com/mhajder/tftp-rs/commit/e9a47a058f31f69d1e0cc77ae907e077458c4d47))
+* add job timeouts to release workflow ([7baa33e](https://github.com/mhajder/tftp-rs/commit/7baa33eab76c84c39b7fec6b5aa1ee72b37e087a))
+* pin actions to commit SHAs at latest versions ([#44](https://github.com/mhajder/tftp-rs/issues/44)) ([f11e8e5](https://github.com/mhajder/tftp-rs/commit/f11e8e50f0747264a77595849adcb553d75a11ea))
+* publish to crates.io last and add checksums and provenance to releases ([7c36522](https://github.com/mhajder/tftp-rs/commit/7c36522a500548448b60668d468f1425e1867222))
+* queue release runs so they never overlap ([4127cd6](https://github.com/mhajder/tftp-rs/commit/4127cd61350e4c888670aa16b5c1fcb4833f4704))
+
+
+### 📦 Build
+
+* add typos pre-commit hook ([b943f4c](https://github.com/mhajder/tftp-rs/commit/b943f4c8bcd63453a6b67333e54fdeae5710c173))
+* package only source, tests and docs in the crate ([44c903c](https://github.com/mhajder/tftp-rs/commit/44c903cd43ccdb16856a55293685effbcb9013a0))
+* update crate description, keywords and categories ([21220f8](https://github.com/mhajder/tftp-rs/commit/21220f89344350b13778fee0f9b37cb700862f1a))
+
+
+### 🧪 Tests
+
+* cover retries, completion, refusals and panics ([fdb4910](https://github.com/mhajder/tftp-rs/commit/fdb49100db2c78a9f7ff5ebcda13fc69fbf84aff))
+* run integration tests against the real server ([37e080c](https://github.com/mhajder/tftp-rs/commit/37e080c4108f43991ae746d3f0dcbfb4d19fd51d))
+
 ## [0.4.2](https://github.com/mhajder/tftp-rs/compare/v0.4.1...v0.4.2) (2026-10-04)
 
 

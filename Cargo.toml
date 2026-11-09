@@ -1,6 +1,6 @@
 [package]
 name = "tftp-rs"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 description = "Async TFTP server with a live TUI dashboard, also embeddable as a tokio library: blksize, tsize, timeout and windowsize options (RFC 2347-2349, 7440), netascii and an optional HTTP file browser"
 license = "MIT"
