@@ -67,7 +67,7 @@ impl App {
         // only case where enumerating the host's addresses tells the truth.
         // Even then, --interface narrows it to that interface's addresses.
         let interface_ips = if bind.is_unspecified() {
-            get_interface_ips(interface.as_deref())
+            get_interface_ips(bind, interface.as_deref())
         } else {
             Vec::new()
         };
@@ -110,7 +110,7 @@ impl App {
 
     pub fn refresh_interfaces_if_needed(&mut self) {
         if self.bind.is_unspecified() && self.last_ip_refresh.elapsed() >= IP_REFRESH_INTERVAL {
-            self.interface_ips = get_interface_ips(self.interface.as_deref());
+            self.interface_ips = get_interface_ips(self.bind, self.interface.as_deref());
             self.last_ip_refresh = Instant::now();
         }
     }
@@ -211,7 +211,11 @@ fn timestamp_now() -> String {
 /// only its addresses qualify. Loopback is filtered out only when no
 /// interface was named: asking for `lo0` and being told "none" would be
 /// worse than useless.
-fn get_interface_ips(interface: Option<&str>) -> Vec<String> {
+///
+/// An IPv4 wildcard answers on IPv4 addresses only. An IPv6 wildcard answers
+/// on IPv6 addresses, and on IPv4 ones too on the usual dual-stack host, so
+/// both are listed for it.
+fn get_interface_ips(bind: IpAddr, interface: Option<&str>) -> Vec<String> {
     let mut ips: Vec<String> = if_addrs::get_if_addrs()
         .unwrap_or_default()
         .into_iter()
@@ -219,7 +223,7 @@ fn get_interface_ips(interface: Option<&str>) -> Vec<String> {
             Some(name) => interface_matches(&iface.name, name),
             None => !iface.is_loopback(),
         })
-        .filter(|iface| iface.addr.ip().is_ipv4())
+        .filter(|iface| bind.is_ipv6() || iface.addr.ip().is_ipv4())
         .map(|iface| iface.addr.ip().to_string())
         .collect();
     ips.sort();

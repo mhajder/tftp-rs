@@ -130,6 +130,18 @@ impl Packet {
         }
     }
 
+    /// The packet's type, without any of its contents.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Packet::RRQ { .. } => "RRQ",
+            Packet::WRQ { .. } => "WRQ",
+            Packet::DATA { .. } => "DATA",
+            Packet::ACK { .. } => "ACK",
+            Packet::ERROR { .. } => "ERROR",
+            Packet::OACK { .. } => "OACK",
+        }
+    }
+
     /// Build an ERROR packet from a numeric code.
     #[cfg(test)]
     pub fn error(code: u16, msg: &str) -> Self {

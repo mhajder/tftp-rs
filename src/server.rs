@@ -4,7 +4,7 @@ use std::ffi::CString;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -312,17 +312,32 @@ fn effective_max_blksize(config: &ServerConfig) -> usize {
     }
 }
 
-/// Maximum number of retries when the kernel returns ENOBUFS (macOS error 55)
-/// because the outgoing buffer is temporarily full.
+/// Maximum number of retries when the kernel returns ENOBUFS because the
+/// outgoing buffer is temporarily full.
 const ENOBUFS_MAX_RETRIES: u32 = 50;
 
-/// Send a datagram, retrying transparently on transient ENOBUFS (os error 55)
-/// errors that macOS produces when the outgoing buffer is momentarily full.
+/// Whether a send failed only because the outgoing buffer is momentarily full.
+///
+/// The number differs by platform: 55 on macOS, 105 on Linux, and
+/// `WSAENOBUFS` (10055) on Windows. Matching macOS's alone would end a Linux
+/// or Windows transfer on the first full queue instead of waiting it out.
+fn is_no_buffer_space(error: &std::io::Error) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const ENOBUFS: i32 = libc::ENOBUFS;
+    #[cfg(windows)]
+    const ENOBUFS: i32 = 10055;
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    const ENOBUFS: i32 = 55;
+    error.raw_os_error() == Some(ENOBUFS)
+}
+
+/// Send a datagram, retrying transparently on transient ENOBUFS errors
+/// produced when the outgoing buffer is momentarily full.
 async fn send_resilient(sock: &UdpSocket, buf: &[u8]) -> Result<()> {
     for attempt in 0..ENOBUFS_MAX_RETRIES {
         match sock.send(buf).await {
             Ok(_) => return Ok(()),
-            Err(e) if e.raw_os_error() == Some(55) => {
+            Err(e) if is_no_buffer_space(&e) => {
                 // ENOBUFS — back off briefly with exponential delay
                 // (1 ms, 2 ms, 4 ms … capped at 50 ms).
                 let delay_ms = (1u64 << attempt.min(5)).min(50);
@@ -332,7 +347,7 @@ async fn send_resilient(sock: &UdpSocket, buf: &[u8]) -> Result<()> {
         }
     }
     Err(anyhow!(
-        "send failed: No buffer space available (os error 55) after {ENOBUFS_MAX_RETRIES} retries"
+        "send failed: no buffer space available after {ENOBUFS_MAX_RETRIES} retries"
     ))
 }
 
@@ -557,9 +572,22 @@ pub fn single_line(text: &str) -> String {
     out
 }
 
+/// Longest [`ServerEvent::Log`] line this crate emits, in characters.
+///
+/// Log lines quote what clients sent, a filename or a transfer mode, and one
+/// datagram can carry 64 KiB of it. Kept whole, a few thousand such requests
+/// would put hundreds of megabytes into the dashboard's history and the log
+/// file.
+const MAX_LOG_CHARS: usize = 1024;
+
 /// Build a [`ServerEvent::Log`] that is safe to write to a log a line at a time.
 fn log_event(message: String) -> ServerEvent {
-    ServerEvent::Log(single_line(&message))
+    let mut line = single_line(&message);
+    if let Some((cut, _)) = line.char_indices().nth(MAX_LOG_CHARS) {
+        line.truncate(cut);
+        line.push_str("...");
+    }
+    ServerEvent::Log(line)
 }
 
 // ---------------------------------------------------------------------------
@@ -807,8 +835,9 @@ async fn run_inner(
     let mut malformed_replies = ReplyBudget::new();
 
     // Track in-progress transfers to reject duplicate requests from the same peer.
-    let reqs_in_progress: Arc<tokio::sync::Mutex<HashSet<SocketAddr>>> =
-        Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+    // A std mutex: the lock is never held across an await, and the guard that
+    // releases a peer has to take it from `Drop`.
+    let reqs_in_progress: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
 
     // One permit per transfer in flight, released when its task ends.
     let transfer_slots = Arc::new(tokio::sync::Semaphore::new(
@@ -866,9 +895,13 @@ async fn run_inner(
                 let (kind, filename, mode, options) = match pkt {
                     Packet::RRQ { filename, mode, options } => (TransferKind::Download, filename, mode, options),
                     Packet::WRQ { filename, mode, options } => (TransferKind::Upload, filename, mode, options),
+                    // Only the kind is logged. The Debug form of a DATA packet
+                    // spells out every payload byte, so one 64 KiB datagram
+                    // would become a log line of several hundred kilobytes.
                     other => {
                         let _ = tx.send(log_event(format!(
-                            "{peer}: unexpected packet on listener: {other:?}"
+                            "{peer}: unexpected {} packet on listener",
+                            other.kind()
                         )));
                         continue;
                     }
@@ -880,7 +913,12 @@ async fn run_inner(
 
                 if !enabled {
                     let _ = tx.send(log_event(format!("{peer}: {request} rejected ({disabled})")));
-                    send_error(local_addr, interface.as_ref(), peer, 2, denied).await;
+                    // The same unverified source as a malformed request, and
+                    // the same longer-than-the-request reply, so the same
+                    // budget applies.
+                    if malformed_replies.take() {
+                        send_error(local_addr, interface.as_ref(), peer, 2, denied).await;
+                    }
                     continue;
                 }
 
@@ -894,13 +932,10 @@ async fn run_inner(
                 };
 
                 // Reject duplicate request from same peer.
-                {
-                    let mut in_progress = reqs_in_progress.lock().await;
-                    if !in_progress.insert(peer) {
-                        let _ = tx.send(log_event(format!("{peer}: duplicate {request} ignored (transfer in progress)")));
-                        continue;
-                    }
-                }
+                let Some(in_progress) = PeerInProgress::claim(&reqs_in_progress, peer) else {
+                    let _ = tx.send(log_event(format!("{peer}: duplicate {request} ignored (transfer in progress)")));
+                    continue;
+                };
 
                 let id = next_id;
                 next_id += 1;
@@ -914,13 +949,12 @@ async fn run_inner(
                     config: Arc::clone(&config),
                 };
                 let tx2 = tx.clone();
-                let rip = Arc::clone(&reqs_in_progress);
                 tokio::spawn(async move {
                     let result = match kind {
                         TransferKind::Download => handle_rrq(ctx, &filename, &mode, &options).await,
                         TransferKind::Upload => handle_wrq(ctx, &filename, &mode, &options).await,
                     };
-                    rip.lock().await.remove(&peer);
+                    drop(in_progress);
                     drop(slot);
                     if let Err(e) = result {
                         let _ = tx2.send(ServerEvent::TransferFailed { id, error: e.to_string() });
@@ -935,6 +969,39 @@ async fn run_inner(
         }
     }
     Ok(())
+}
+
+/// A peer's entry in the set of transfers in progress, released on drop.
+///
+/// Releasing on drop rather than after the handler returns means a handler
+/// that panics still frees the peer. Otherwise every later request from that
+/// address would be ignored as a duplicate for as long as the server runs.
+struct PeerInProgress {
+    set: Arc<Mutex<HashSet<SocketAddr>>>,
+    peer: SocketAddr,
+}
+
+impl PeerInProgress {
+    /// Mark `peer` as busy, or return `None` if it already is.
+    fn claim(set: &Arc<Mutex<HashSet<SocketAddr>>>, peer: SocketAddr) -> Option<Self> {
+        let inserted = set
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(peer);
+        inserted.then(|| Self {
+            set: Arc::clone(set),
+            peer,
+        })
+    }
+}
+
+impl Drop for PeerInProgress {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.peer);
+    }
 }
 
 /// A token bucket limiting how often the listener answers a datagram it could
@@ -1141,11 +1208,12 @@ async fn handle_rrq(
         tx,
         config,
     } = ctx;
-    let dir = dir.as_path();
     let config = config.as_ref();
 
     let opened = async {
-        let path = sanitize_path(dir, filename).map_err(RequestFailure::illegal)?;
+        let path = resolve_request_path(&dir, filename)
+            .await
+            .map_err(RequestFailure::illegal)?;
         // Half of an upload still being written, or one about to be thrown
         // away. Not a file, whatever it holds right now.
         if is_staging_path(&path) {
@@ -1624,9 +1692,8 @@ async fn handle_wrq(
         tx,
         config,
     } = ctx;
-    let dir = dir.as_path();
     let config = config.as_ref();
-    let path = match sanitize_path(dir, filename) {
+    let path = match resolve_request_path(&dir, filename).await {
         Ok(path) => path,
         Err(e) => {
             let failure = RequestFailure::illegal(e);
@@ -2119,7 +2186,7 @@ async fn handle_wrq(
                 // drivers have no hard links. Refusing to promote there would
                 // make every upload fail on them, so fall back to a rename and
                 // accept that the existence check is no longer atomic.
-                if path.exists() {
+                if tokio::fs::try_exists(&path).await.unwrap_or(false) {
                     send_transfer_error(&sock, 6, "File already exists").await;
                     return Err(anyhow!("file already exists: {}", path.display()));
                 }
@@ -2218,6 +2285,19 @@ async fn refuse_oversized_upload(sock: &UdpSocket, transferred: u64, limit: u64)
     }
     send_transfer_error(sock, 3, "Disk full or allocation exceeded").await;
     Err(anyhow!("upload exceeded the {limit} byte limit"))
+}
+
+/// [`sanitize_path`] on the blocking pool.
+///
+/// Resolving a path canonicalizes it and probes the filesystem, which can
+/// stall on a slow or network-mounted directory. Run on the async worker,
+/// that stall would hold up every transfer and the listener sharing it.
+async fn resolve_request_path(dir: &Arc<PathBuf>, filename: &str) -> Result<PathBuf> {
+    let dir = Arc::clone(dir);
+    let filename = filename.to_owned();
+    tokio::task::spawn_blocking(move || sanitize_path(&dir, &filename))
+        .await
+        .map_err(|e| anyhow!("path resolution did not complete: {e}"))?
 }
 
 /// Ensure the requested filename stays inside the served directory.
