@@ -105,8 +105,9 @@ cargo build --release
 The binary will be at `target/release/tftp-rs`.
 
 > [!NOTE]
-> Port 69 is privileged. Run tftp-rs as root, grant it `CAP_NET_BIND_SERVICE` on Linux
+> On Linux, port 69 is privileged. Run tftp-rs as root, grant it `CAP_NET_BIND_SERVICE`
 > (`sudo setcap cap_net_bind_service=+ep "$(which tftp-rs)"`), or pick a port above 1024 with `-p`.
+> macOS and Windows let any user bind it.
 
 ## 🚀 Usage
 
@@ -213,70 +214,23 @@ tftp localhost 69
 
 ## 📚 Library
 
-The package also exports a `tftp_rs` library target. The caller owns the
-explicit local bind address and shutdown lifecycle:
+The package also exports a `tftp_rs` library, so you can embed the server in
+your own tokio application. Add it without the dashboard and its dependencies:
 
-```rust
-use std::net::SocketAddr;
-
-use tftp_rs::server::{run, ServerConfig, ServerEvent};
-use tokio::sync::{mpsc, watch};
-
-async fn example() -> anyhow::Result<()> {
-    let bind: SocketAddr = "192.0.2.1:69".parse()?;
-    let (events, _event_rx) = mpsc::unbounded_channel::<ServerEvent>();
-    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    run(bind, "/srv/tftp".into(), events, shutdown_rx, ServerConfig::default()).await?;
-    Ok(())
-}
+```bash
+cargo add tftp-rs --no-default-features
 ```
 
-`events` carries progress and log messages for a caller that wants to show
-them. It is not part of the transfer path: drop the receiver and the events
-stop, while the server goes on serving files and still shuts down cleanly. A
-caller that wants none of them can drop it straight away.
+[`server::run`](https://docs.rs/tftp-rs/latest/tftp_rs/server/fn.run.html)
+serves one local address, and
+[`server::run_on_interface`](https://docs.rs/tftp-rs/latest/tftp_rs/server/fn.run_on_interface.html)
+also pins every socket to one network interface on Linux and macOS. You own
+the bind address, the shutdown signal and the
+[`ServerEvent`](https://docs.rs/tftp-rs/latest/tftp_rs/server/enum.ServerEvent.html)
+stream of logs and progress.
 
-For a service that must remain on one macOS or Linux interface, use
-`run_on_interface`. It applies the OS interface binding to the listener,
-temporary error replies, and every ephemeral TFTP transfer socket; it fails
-instead of falling back to an unbound socket. A wildcard address is accepted
-here, because the interface binding already scopes the service:
-
-```rust
-use std::net::SocketAddr;
-
-use tftp_rs::server::{run_on_interface, ServerConfig, ServerEvent};
-use tokio::sync::{mpsc, watch};
-
-async fn example() -> anyhow::Result<()> {
-    let bind: SocketAddr = "192.0.2.1:69".parse()?;
-    let (events, _event_rx) = mpsc::unbounded_channel::<ServerEvent>();
-    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    run_on_interface(
-        bind,
-        "en7",
-        "/srv/tftp".into(),
-        events,
-        shutdown_rx,
-        ServerConfig::default(),
-    )
-    .await?;
-    Ok(())
-}
-```
-
-On Linux this needs no `CAP_NET_RAW`. The kernel requires that capability
-only when a socket is re-bound to a different device, and each socket here
-is created and bound once. Serving the default port 69 still needs root or
-`CAP_NET_BIND_SERVICE`.
-
-The TUI binary is the default Cargo feature. Embedders can skip its dashboard
-and HTTP dependencies:
-
-```toml
-[dependencies]
-tftp-rs = { version = "0.4", default-features = false }
-```
+The quick start, examples and full API reference are on
+**[docs.rs/tftp-rs](https://docs.rs/tftp-rs)**.
 
 ## 🧱 Architecture
 
