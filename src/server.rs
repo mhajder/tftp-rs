@@ -1,3 +1,15 @@
+//! The TFTP server: entry points, configuration and the events it reports.
+//!
+//! Start the server with [`run`], or [`run_on_interface`] to keep it on one
+//! network interface, and tune it with [`ServerConfig`]. While it runs it
+//! sends [`ServerEvent`]s describing what it is doing.
+//!
+//! The other functions help a host application check its setup before
+//! starting the server ([`validate_bind_addr`], [`validate_interface`],
+//! [`probe_bind`]), run companion services the same way
+//! ([`bind_tcp_listener`]), or serve the same directory safely over another
+//! protocol ([`sanitize_path`], [`is_upload_staging_name`], [`single_line`]).
+
 use std::collections::{HashMap, HashSet};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::CString;
@@ -57,6 +69,21 @@ static MAX_SENDABLE_BLKSIZE: OnceLock<usize> = OnceLock::new();
 // ---------------------------------------------------------------------------
 
 /// Runtime-configurable server settings.
+///
+/// Start from [`ServerConfig::default`] and change what you need:
+///
+/// ```
+/// use tftp_rs::server::ServerConfig;
+///
+/// let config = ServerConfig {
+///     max_window_size: 8,                  // RFC 7440 windowed transfers
+///     max_block_size: 1468,                // fit a 1500-byte MTU over IPv4
+///     allow_overwrite: false,              // refuse to replace existing files
+///     max_upload_bytes: 512 * 1024 * 1024, // 512 MiB per upload
+///     ..ServerConfig::default()
+/// };
+/// assert!(config.validate().is_ok());
+/// ```
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Reply timeout in milliseconds (default 500).
@@ -500,43 +527,111 @@ async fn send_error(
 // Shared state exposed to the TUI
 // ---------------------------------------------------------------------------
 
-/// Direction of a transfer.
+/// Direction of a transfer, from the client's point of view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferKind {
-    Download, // RRQ  (client is downloading from us)
-    Upload,   // WRQ  (client is uploading to us)
+    /// A read request (RRQ): the client downloads a file from the server.
+    Download,
+    /// A write request (WRQ): the client uploads a file to the server.
+    Upload,
 }
 
-/// A snapshot of a running transfer, suitable for display.
+/// A transfer that has just started, as reported by
+/// [`ServerEvent::TransferStarted`].
 #[derive(Debug, Clone)]
 pub struct TransferInfo {
+    /// Identifies the transfer in later events. Assigned in request order,
+    /// starting at 1, and unique for the life of one server.
     pub id: u64,
+    /// The client's address and port.
     pub peer: SocketAddr,
+    /// The file name as the client sent it, relative to the served directory.
+    ///
+    /// Kept verbatim, control characters included. Pass it through
+    /// [`single_line`] before writing it to a log or a terminal.
     pub filename: String,
+    /// Whether the client is downloading or uploading.
     pub kind: TransferKind,
-    /// Total file size in bytes (known for downloads only).
+    /// Size of the transfer in bytes: the file size for a download, and for
+    /// an upload the size the client declared with the `tsize` option, or 0
+    /// if it declared none.
     pub total_bytes: u64,
-    /// Bytes transferred so far.
+    /// Bytes transferred so far. Always 0 here;
+    /// [`ServerEvent::TransferProgress`] carries the running count.
     pub transferred: u64,
-    /// Transfer start time.
+    /// When the transfer started.
     pub started: Instant,
-    /// Whether the total file size is known (true for downloads, false for uploads).
+    /// Whether `total_bytes` is meaningful: always for a download, and for an
+    /// upload only when the client declared a nonzero size. A declared size of
+    /// 0, or one that is not a number, counts as none.
     pub size_known: bool,
 }
 
-/// Events emitted by the server for the TUI.
+/// Something the server reports while it runs.
+///
+/// Events are for display only. Dropping the receiver stops them and changes
+/// nothing else: the server goes on serving files.
+///
+/// A transfer starts with [`TransferStarted`](Self::TransferStarted), reports
+/// [`TransferProgress`](Self::TransferProgress) as blocks are acknowledged,
+/// and ends with [`TransferComplete`](Self::TransferComplete) or
+/// [`TransferFailed`](Self::TransferFailed). A request that fails before its
+/// transfer starts, for example because the file does not exist, still
+/// produces a `TransferFailed`, with an id no `TransferStarted` announced. A
+/// request the listener turns away without starting a transfer, because reads
+/// or writes are disabled, too many transfers are in progress or the peer
+/// already has one, gets no id and produces only a [`Log`](Self::Log) line.
+///
+/// ```no_run
+/// use tftp_rs::server::ServerEvent;
+/// use tokio::sync::mpsc;
+///
+/// async fn show(mut events: mpsc::UnboundedReceiver<ServerEvent>) {
+///     while let Some(event) = events.recv().await {
+///         match event {
+///             ServerEvent::Log(line) => println!("{line}"),
+///             ServerEvent::TransferStarted(info) => {
+///                 println!("#{} {:?} from {}", info.id, info.kind, info.peer)
+///             }
+///             ServerEvent::TransferProgress { id, transferred, total_bytes } => {
+///                 println!("#{id}: {transferred}/{total_bytes} bytes")
+///             }
+///             ServerEvent::TransferComplete(id) => println!("#{id} done"),
+///             ServerEvent::TransferFailed { id, error } => println!("#{id} failed: {error}"),
+///         }
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub enum ServerEvent {
+    /// A human-readable log line, already passed through [`single_line`].
+    /// The server also cuts lines longer than 1024 characters, which then end
+    /// in `...`; [`single_line`] itself does not shorten anything.
     Log(String),
+    /// A transfer has started.
     TransferStarted(TransferInfo),
+    /// How far a transfer has got, sent after each acknowledged block or
+    /// window.
     TransferProgress {
+        /// The transfer, as in [`TransferInfo::id`].
         id: u64,
+        /// Bytes transferred so far. This can end above `total_bytes`: a
+        /// netascii download counts the encoded bytes it sends, and an upload
+        /// can carry more than the client declared with `tsize`.
         transferred: u64,
+        /// As in [`TransferInfo::total_bytes`], except that an upload with no
+        /// declared size reports `transferred` here.
         total_bytes: u64,
     },
+    /// A transfer finished successfully. Carries its id.
     TransferComplete(u64),
+    /// A transfer, or a request before its transfer started, failed.
     TransferFailed {
+        /// The transfer, as in [`TransferInfo::id`].
         id: u64,
+        /// What went wrong, for display. Not passed through [`single_line`]:
+        /// it can quote the resolved path on the server's filesystem, or the
+        /// message from an ERROR packet the client sent.
         error: String,
     },
 }
@@ -554,6 +649,17 @@ pub enum ServerEvent {
 /// here. It is public for callers that build log lines of their own from a
 /// [`TransferInfo::filename`], which is kept verbatim because it is the name of
 /// a file rather than a message about one.
+///
+/// ```
+/// use tftp_rs::server::single_line;
+///
+/// assert_eq!(single_line("fw.bin"), "fw.bin");
+/// assert_eq!(
+///     single_line("fw.bin\n10.0.0.9: WRQ \"forged\""),
+///     "fw.bin\\n10.0.0.9: WRQ \"forged\"",
+/// );
+/// assert_eq!(single_line("\u{1b}[2J"), "\\u{001b}[2J");
+/// ```
 pub fn single_line(text: &str) -> String {
     if !text.contains(|c: char| c.is_control()) {
         return text.to_string();
@@ -713,6 +819,47 @@ fn describe_options(
 /// `tx` carries progress and log events for a caller that wants to display
 /// them. It is not part of the transfer path: dropping the receiver stops the
 /// events and nothing else, and the server goes on serving files.
+///
+/// # Shutdown
+///
+/// Returns `Ok(())` once a value is sent on `shutdown`'s sender after
+/// `shutdown` last saw one, whatever the value, or the sender is dropped, so
+/// keep it alive for as long as the server should run. A value the receiver
+/// has already seen, such as the one it was created with, does not count.
+/// Transfers already in progress are not cancelled: each one carries on until
+/// it completes or runs out of retries.
+///
+/// # Errors
+///
+/// Fails before serving anything if `config` does not pass
+/// [`ServerConfig::validate`] or `bind_addr` cannot be bound, for example
+/// because the port is in use or needs privileges. Once serving, it fails if
+/// receiving on the listening socket fails 100 times in a row.
+///
+/// # Example
+///
+/// ```no_run
+/// use tftp_rs::server::{run, ServerConfig};
+/// use tokio::sync::{mpsc, watch};
+///
+/// # async fn example() -> anyhow::Result<()> {
+/// let (events, _) = mpsc::unbounded_channel();
+/// let (shutdown_tx, shutdown_rx) = watch::channel(false);
+/// let server = tokio::spawn(run(
+///     "192.0.2.1:69".parse()?,
+///     "/srv/tftp".into(),
+///     events,
+///     shutdown_rx,
+///     ServerConfig::default(),
+/// ));
+///
+/// // ... later, stop accepting requests. The send fails only if the server
+/// // has already stopped, and `server.await` then reports why.
+/// let _ = shutdown_tx.send(true);
+/// server.await??;
+/// # Ok(())
+/// # }
+/// ```
 pub async fn run(
     bind_addr: SocketAddr,
     dir: PathBuf,
@@ -777,6 +924,36 @@ pub fn probe_bind(bind_addr: SocketAddr, interface: Option<&str>) -> Result<()> 
 /// # Platform support
 ///
 /// Linux and macOS only. Other targets return an error.
+///
+/// # Shutdown and errors
+///
+/// As for [`run`], plus an error if `interface_name` does not name a current
+/// interface or the socket option cannot be applied.
+///
+/// # Example
+///
+/// ```no_run
+/// use tftp_rs::server::{run_on_interface, validate_interface, ServerConfig};
+/// use tokio::sync::{mpsc, watch};
+///
+/// # async fn example() -> anyhow::Result<()> {
+/// // Reject a typo before starting anything.
+/// validate_interface("eth0")?;
+///
+/// let (events, _) = mpsc::unbounded_channel();
+/// let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+/// run_on_interface(
+///     "0.0.0.0:69".parse()?,
+///     "eth0",
+///     "/srv/tftp".into(),
+///     events,
+///     shutdown_rx,
+///     ServerConfig::default(),
+/// )
+/// .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub async fn run_on_interface(
     bind_addr: SocketAddr,
     interface_name: &str,
@@ -1118,8 +1295,8 @@ fn file_error_reply(error: &std::io::Error) -> (u16, &'static str) {
     }
 }
 
-/// Whether `name` is the staging file of an upload still in progress, as named
-/// by [`part_path`]: the target name, a transfer id, and `.part`.
+/// Whether `name` is the staging file of an upload still in progress: the
+/// target name, a transfer id, and `.part`, as in `fw.bin.7.part`.
 ///
 /// A staging file holds a partial upload, or one that is about to be
 /// discarded. The TFTP server neither reads nor writes one by that name, and
@@ -1130,6 +1307,15 @@ fn file_error_reply(error: &std::io::Error) -> (u16, &'static str) {
 /// Windows, and FAT everywhere, ignore case in a name, and Windows drops
 /// trailing dots and spaces, so `fw.bin.7.PART` and `fw.bin.7.part.` name the
 /// same file as `fw.bin.7.part` there.
+///
+/// ```
+/// use tftp_rs::server::is_upload_staging_name;
+///
+/// assert!(is_upload_staging_name("fw.bin.7.part"));
+/// assert!(is_upload_staging_name("fw.bin.7.PART"));
+/// assert!(!is_upload_staging_name("fw.bin"));
+/// assert!(!is_upload_staging_name("notes.part"));
+/// ```
 pub fn is_upload_staging_name(name: &str) -> bool {
     let name = name.trim_end_matches(['.', ' ']);
     let suffix = name.len().saturating_sub(".part".len());
@@ -2303,6 +2489,31 @@ async fn resolve_request_path(dir: &Arc<PathBuf>, filename: &str) -> Result<Path
 /// Ensure the requested filename stays inside the served directory.
 /// Supports subdirectory paths (e.g. `ios/config/router.cfg`) while
 /// rejecting any traversal attempt (`..`) or absolute paths.
+///
+/// Backslashes count as separators, so Windows-style names work and cannot
+/// sneak past the checks. Symlinks are followed: an existing file is returned
+/// as its canonical path and must resolve inside `dir`. A file that does not
+/// exist yet (an upload) is returned as `dir` joined with the cleaned name,
+/// once its deepest existing ancestor is confirmed to be inside `dir`.
+///
+/// This is the check the TFTP server applies to every request. Use it for
+/// anything else that serves the same directory, such as an HTTP server.
+///
+/// ```
+/// use tftp_rs::server::sanitize_path;
+///
+/// # fn main() -> anyhow::Result<()> {
+/// let dir = std::env::temp_dir();
+///
+/// assert!(sanitize_path(&dir, "../etc/passwd").is_err());
+/// assert!(sanitize_path(&dir, "/etc/passwd").is_err());
+/// assert!(sanitize_path(&dir, "configs\\..\\..\\secret").is_err());
+///
+/// let upload = sanitize_path(&dir, "tftp-rs-doc/configs/sw1.cfg")?;
+/// assert!(upload.starts_with(&dir));
+/// # Ok(())
+/// # }
+/// ```
 pub fn sanitize_path(dir: &Path, filename: &str) -> Result<PathBuf> {
     let normalized = filename.replace('\\', "/");
 
