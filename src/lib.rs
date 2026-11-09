@@ -31,9 +31,8 @@
 //! async fn main() -> anyhow::Result<()> {
 //!     let bind: SocketAddr = "192.0.2.1:69".parse()?;
 //!     let (events, mut event_rx) = mpsc::unbounded_channel();
-//!     // Send a value (conventionally `true`) to stop the server. Dropping the
-//!     // sender stops it too, so keep it alive for as long as the server
-//!     // should run.
+//!     // Send `true` to stop the server. Dropping the sender stops it too,
+//!     // so keep it alive for as long as the server should run.
 //!     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 //!
 //!     // Print what the server logs. Leave this out, and drop `event_rx`,
@@ -60,9 +59,8 @@
 //!   dashboard and HTTP file server. The library does not use it, so
 //!   embedders can turn it off and skip those dependencies:
 //!
-//!   ```toml
-//!   [dependencies]
-//!   tftp-rs = { version = "0.4", default-features = false }
+//!   ```sh
+//!   cargo add tftp-rs --no-default-features
 //!   ```
 //!
 //! # Platform support

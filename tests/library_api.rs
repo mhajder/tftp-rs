@@ -240,6 +240,63 @@ async fn binds_listener_and_transfer_sockets_to_named_interface() {
     server.await.expect("server task").expect("server result");
 }
 
+#[tokio::test]
+async fn a_receiver_that_already_reads_true_stops_run() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let (events, _event_rx) = mpsc::unbounded_channel();
+    // The receiver has already seen `true`: there is no change left to wait
+    // for, so only a check of the current value can stop the server.
+    let (_shutdown_tx, shutdown_rx) = watch::channel(true);
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        run(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            dir.path().to_path_buf(),
+            events,
+            shutdown_rx,
+            ServerConfig::default(),
+        ),
+    )
+    .await
+    .expect("run must return once the receiver already reads true")
+    .expect("server result");
+}
+
+#[tokio::test]
+async fn sending_false_does_not_stop_the_server() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server_dir = dir.path().to_path_buf();
+    let mut server = tokio::spawn(async move {
+        run(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            server_dir,
+            events,
+            shutdown_rx,
+            ServerConfig::default(),
+        )
+        .await
+    });
+    wait_until_listening(&mut event_rx).await;
+
+    shutdown_tx.send(false).expect("send false");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut server)
+            .await
+            .is_err(),
+        "sending false must leave the server running"
+    );
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("server must stop on true")
+        .expect("server task")
+        .expect("server result");
+}
+
 async fn wait_until_listening(events: &mut mpsc::UnboundedReceiver<ServerEvent>) {
     loop {
         let event = tokio::time::timeout(Duration::from_secs(2), events.recv())

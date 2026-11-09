@@ -625,7 +625,8 @@ pub enum ServerEvent {
     },
     /// A transfer finished successfully. Carries its id.
     TransferComplete(u64),
-    /// A transfer, or a request before its transfer started, failed.
+    /// A transfer, or a request before its transfer started, failed. A
+    /// transfer whose handler panics is reported here too.
     TransferFailed {
         /// The transfer, as in [`TransferInfo::id`].
         id: u64,
@@ -822,10 +823,9 @@ fn describe_options(
 ///
 /// # Shutdown
 ///
-/// Returns `Ok(())` once a value is sent on `shutdown`'s sender after
-/// `shutdown` last saw one, whatever the value, or the sender is dropped, so
-/// keep it alive for as long as the server should run. A value the receiver
-/// has already seen, such as the one it was created with, does not count.
+/// Returns `Ok(())` once `shutdown` reads `true`, including when it already
+/// does as `run` starts, or once its sender is dropped. Keep the sender alive
+/// for as long as the server should run; sending `false` does nothing.
 /// Transfers already in progress are not cancelled: each one carries on until
 /// it completes or runs out of retries.
 ///
@@ -1127,10 +1127,19 @@ async fn run_inner(
                 };
                 let tx2 = tx.clone();
                 tokio::spawn(async move {
-                    let result = match kind {
-                        TransferKind::Download => handle_rrq(ctx, &filename, &mode, &options).await,
-                        TransferKind::Upload => handle_wrq(ctx, &filename, &mode, &options).await,
-                    };
+                    // The handler runs as a task of its own so that a panic
+                    // in it ends here as an error. Otherwise a started
+                    // transfer would never be reported as finished, and
+                    // whoever watches the events would show it forever.
+                    let handler = tokio::spawn(async move {
+                        match kind {
+                            TransferKind::Download => handle_rrq(ctx, &filename, &mode, &options).await,
+                            TransferKind::Upload => handle_wrq(ctx, &filename, &mode, &options).await,
+                        }
+                    });
+                    let result = handler
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow!("internal error: {e}")));
                     drop(in_progress);
                     drop(slot);
                     if let Err(e) = result {
@@ -1139,7 +1148,12 @@ async fn run_inner(
                     }
                 });
             }
-            _ = shutdown.changed() => {
+            // `wait_for` looks at the current value before waiting, so a
+            // receiver that already reads `true` stops the server straight
+            // away. A dropped sender ends the wait with an error, which stops
+            // it too: nothing could ever signal it otherwise. The guard
+            // `wait_for` returns is not `Send`, so it is dropped in here.
+            _ = async { shutdown.wait_for(|&stop| stop).await.map(drop) } => {
                 let _ = tx.send(log_event("Shutting down".into()));
                 break;
             }
