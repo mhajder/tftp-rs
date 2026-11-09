@@ -7,6 +7,13 @@ use tftp_rs::server::{ServerConfig, ServerEvent, probe_bind, run, validate_bind_
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 
+mod common;
+
+use common::{
+    expect_ack, receive_blocks, rrq, rrq_with_options, send_data, start, wait_until_listening,
+    wrq_with_options,
+};
+
 #[test]
 fn validate_bind_addr_rejects_wildcards_and_accepts_explicit_addresses() {
     let error = validate_bind_addr(SocketAddr::from(([0, 0, 0, 0], 69)))
@@ -27,18 +34,12 @@ async fn serves_from_a_wildcard_listener() {
         .await
         .expect("test file");
 
-    let reservation = UdpSocket::bind("0.0.0.0:0")
-        .await
-        .expect("reserve test port");
-    let port = reservation.local_addr().expect("listener address").port();
-    drop(reservation);
-
     let (events, mut event_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server_dir = dir.path().to_path_buf();
     let server = tokio::spawn(async move {
         run(
-            SocketAddr::from(([0, 0, 0, 0], port)),
+            SocketAddr::from(([0, 0, 0, 0], 0)),
             server_dir,
             events,
             shutdown_rx,
@@ -47,7 +48,7 @@ async fn serves_from_a_wildcard_listener() {
         .await
     });
 
-    wait_until_listening(&mut event_rx).await;
+    let port = wait_until_listening(&mut event_rx).await.port();
 
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
     let server_address = SocketAddr::from(([127, 0, 0, 1], port));
@@ -127,18 +128,14 @@ async fn serves_from_the_explicit_listener_address() {
         .await
         .expect("test file");
 
-    let reservation = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("reserve test port");
-    let listener_address = reservation.local_addr().expect("listener address");
-    drop(reservation);
+    let requested_address = SocketAddr::from(([127, 0, 0, 1], 0));
 
     let (events, mut event_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server_dir = dir.path().to_path_buf();
     let server = tokio::spawn(async move {
         run(
-            listener_address,
+            requested_address,
             server_dir,
             events,
             shutdown_rx,
@@ -147,7 +144,7 @@ async fn serves_from_the_explicit_listener_address() {
         .await
     });
 
-    wait_until_listening(&mut event_rx).await;
+    let listener_address = wait_until_listening(&mut event_rx).await;
 
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
     client
@@ -191,18 +188,14 @@ async fn binds_listener_and_transfer_sockets_to_named_interface() {
         .await
         .expect("test file");
 
-    let reservation = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("reserve test port");
-    let listener_address = reservation.local_addr().expect("listener address");
-    drop(reservation);
+    let requested_address = SocketAddr::from(([127, 0, 0, 1], 0));
 
     let (events, mut event_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server_dir = dir.path().to_path_buf();
     let server = tokio::spawn(async move {
         run_on_interface(
-            listener_address,
+            requested_address,
             LOOPBACK_INTERFACE,
             server_dir,
             events,
@@ -212,7 +205,7 @@ async fn binds_listener_and_transfer_sockets_to_named_interface() {
         .await
     });
 
-    wait_until_listening(&mut event_rx).await;
+    let listener_address = wait_until_listening(&mut event_rx).await;
 
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
     client
@@ -297,28 +290,6 @@ async fn sending_false_does_not_stop_the_server() {
         .expect("server result");
 }
 
-async fn wait_until_listening(events: &mut mpsc::UnboundedReceiver<ServerEvent>) {
-    loop {
-        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
-            .await
-            .expect("server startup timeout")
-            .expect("server event channel");
-        if matches!(event, ServerEvent::Log(message) if message.starts_with("Listening on ")) {
-            return;
-        }
-    }
-}
-
-fn rrq(filename: &str) -> Vec<u8> {
-    let mut request = Vec::new();
-    request.extend_from_slice(&1_u16.to_be_bytes());
-    request.extend_from_slice(filename.as_bytes());
-    request.push(0);
-    request.extend_from_slice(b"octet");
-    request.push(0);
-    request
-}
-
 #[tokio::test]
 async fn probe_bind_reports_an_address_already_in_use() {
     let holder = UdpSocket::bind("127.0.0.1:0").await.expect("held socket");
@@ -370,18 +341,14 @@ async fn windowed_download_numbers_blocks_consecutively() {
         .await
         .expect("test file");
 
-    let reservation = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("reserve test port");
-    let listener_address = reservation.local_addr().expect("listener address");
-    drop(reservation);
+    let requested_address = SocketAddr::from(([127, 0, 0, 1], 0));
 
     let (events, mut event_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server_dir = dir.path().to_path_buf();
     let server = tokio::spawn(async move {
         run(
-            listener_address,
+            requested_address,
             server_dir,
             events,
             shutdown_rx,
@@ -393,7 +360,7 @@ async fn windowed_download_numbers_blocks_consecutively() {
         .await
     });
 
-    wait_until_listening(&mut event_rx).await;
+    let listener_address = wait_until_listening(&mut event_rx).await;
 
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
     client
@@ -455,33 +422,18 @@ async fn windowed_download_numbers_blocks_consecutively() {
     server.await.expect("server task").expect("server result");
 }
 
-fn rrq_with_options(filename: &str, options: &[(&str, &str)]) -> Vec<u8> {
-    let mut request = rrq(filename);
-    for (key, value) in options {
-        request.extend_from_slice(key.as_bytes());
-        request.push(0);
-        request.extend_from_slice(value.as_bytes());
-        request.push(0);
-    }
-    request
-}
-
 #[tokio::test]
 async fn a_request_for_a_missing_file_is_answered_with_an_error() {
     let dir = tempfile::tempdir().expect("temporary directory");
 
-    let reservation = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("reserve test port");
-    let listener_address = reservation.local_addr().expect("listener address");
-    drop(reservation);
+    let requested_address = SocketAddr::from(([127, 0, 0, 1], 0));
 
     let (events, mut event_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server_dir = dir.path().to_path_buf();
     let server = tokio::spawn(async move {
         run(
-            listener_address,
+            requested_address,
             server_dir,
             events,
             shutdown_rx,
@@ -490,7 +442,7 @@ async fn a_request_for_a_missing_file_is_answered_with_an_error() {
         .await
     });
 
-    wait_until_listening(&mut event_rx).await;
+    let listener_address = wait_until_listening(&mut event_rx).await;
 
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
     client
@@ -519,18 +471,14 @@ async fn transfers_survive_a_caller_that_stops_reading_events() {
         .await
         .expect("test file");
 
-    let reservation = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("reserve test port");
-    let listener_address = reservation.local_addr().expect("listener address");
-    drop(reservation);
+    let requested_address = SocketAddr::from(([127, 0, 0, 1], 0));
 
     let (events, mut event_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server_dir = dir.path().to_path_buf();
     let server = tokio::spawn(async move {
         run(
-            listener_address,
+            requested_address,
             server_dir,
             events,
             shutdown_rx,
@@ -539,7 +487,7 @@ async fn transfers_survive_a_caller_that_stops_reading_events() {
         .await
     });
 
-    wait_until_listening(&mut event_rx).await;
+    let listener_address = wait_until_listening(&mut event_rx).await;
 
     // An embedder that only wanted a file server, and never a dashboard, has
     // no reason to keep draining events. That must cost it the events alone.
@@ -578,18 +526,14 @@ async fn a_netascii_download_does_not_acknowledge_tsize() {
         .await
         .expect("test file");
 
-    let reservation = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("reserve test port");
-    let listener_address = reservation.local_addr().expect("listener address");
-    drop(reservation);
+    let requested_address = SocketAddr::from(([127, 0, 0, 1], 0));
 
     let (events, mut event_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server_dir = dir.path().to_path_buf();
     let server = tokio::spawn(async move {
         run(
-            listener_address,
+            requested_address,
             server_dir,
             events,
             shutdown_rx,
@@ -598,7 +542,7 @@ async fn a_netascii_download_does_not_acknowledge_tsize() {
         .await
     });
 
-    wait_until_listening(&mut event_rx).await;
+    let listener_address = wait_until_listening(&mut event_rx).await;
 
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
     let mut request = Vec::from(&1_u16.to_be_bytes()[..]);
@@ -664,18 +608,14 @@ async fn unanswered_requests_cannot_take_more_than_their_share_of_sockets() {
         .await
         .expect("test file");
 
-    let reservation = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("reserve test port");
-    let listener_address = reservation.local_addr().expect("listener address");
-    drop(reservation);
+    let requested_address = SocketAddr::from(([127, 0, 0, 1], 0));
 
     let (events, mut event_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server_dir = dir.path().to_path_buf();
     let server = tokio::spawn(async move {
         run(
-            listener_address,
+            requested_address,
             server_dir,
             events,
             shutdown_rx,
@@ -687,7 +627,7 @@ async fn unanswered_requests_cannot_take_more_than_their_share_of_sockets() {
         .await
     });
 
-    wait_until_listening(&mut event_rx).await;
+    let listener_address = wait_until_listening(&mut event_rx).await;
 
     // Each of these takes a slot and never acknowledges anything, so all four
     // stay held for the whole retry budget.
@@ -738,18 +678,14 @@ async fn unanswered_requests_cannot_take_more_than_their_share_of_sockets() {
 async fn an_upload_past_the_size_limit_is_cut_off() {
     let dir = tempfile::tempdir().expect("temporary directory");
 
-    let reservation = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("reserve test port");
-    let listener_address = reservation.local_addr().expect("listener address");
-    drop(reservation);
+    let requested_address = SocketAddr::from(([127, 0, 0, 1], 0));
 
     let (events, mut event_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server_dir = dir.path().to_path_buf();
     let server = tokio::spawn(async move {
         run(
-            listener_address,
+            requested_address,
             server_dir,
             events,
             shutdown_rx,
@@ -761,7 +697,7 @@ async fn an_upload_past_the_size_limit_is_cut_off() {
         .await
     });
 
-    wait_until_listening(&mut event_rx).await;
+    let listener_address = wait_until_listening(&mut event_rx).await;
 
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
     let mut request = Vec::from(&2_u16.to_be_bytes()[..]);
@@ -838,18 +774,14 @@ async fn an_upload_past_the_size_limit_is_cut_off() {
 async fn a_filename_cannot_forge_a_line_in_the_log() {
     let dir = tempfile::tempdir().expect("temporary directory");
 
-    let reservation = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("reserve test port");
-    let listener_address = reservation.local_addr().expect("listener address");
-    drop(reservation);
+    let requested_address = SocketAddr::from(([127, 0, 0, 1], 0));
 
     let (events, mut event_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server_dir = dir.path().to_path_buf();
     let server = tokio::spawn(async move {
         run(
-            listener_address,
+            requested_address,
             server_dir,
             events,
             shutdown_rx,
@@ -858,7 +790,7 @@ async fn a_filename_cannot_forge_a_line_in_the_log() {
         .await
     });
 
-    wait_until_listening(&mut event_rx).await;
+    let listener_address = wait_until_listening(&mut event_rx).await;
 
     // Needs no valid file and no write access: one datagram is enough.
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
@@ -899,18 +831,14 @@ async fn an_upload_onto_a_directory_is_refused_before_it_starts() {
     let dir = tempfile::tempdir().expect("temporary directory");
     std::fs::create_dir(dir.path().join("taken")).expect("a directory in the way");
 
-    let reservation = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("reserve test port");
-    let listener_address = reservation.local_addr().expect("listener address");
-    drop(reservation);
+    let requested_address = SocketAddr::from(([127, 0, 0, 1], 0));
 
     let (events, mut event_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server_dir = dir.path().to_path_buf();
     let server = tokio::spawn(async move {
         run(
-            listener_address,
+            requested_address,
             server_dir,
             events,
             shutdown_rx,
@@ -919,7 +847,7 @@ async fn an_upload_onto_a_directory_is_refused_before_it_starts() {
         .await
     });
 
-    wait_until_listening(&mut event_rx).await;
+    let listener_address = wait_until_listening(&mut event_rx).await;
 
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
     let mut request = Vec::from(&2_u16.to_be_bytes()[..]);
@@ -959,18 +887,14 @@ async fn a_request_for_a_directory_is_answered_with_an_error() {
     let dir = tempfile::tempdir().expect("temporary directory");
     std::fs::create_dir(dir.path().join("subdir")).expect("a directory to request");
 
-    let reservation = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("reserve test port");
-    let listener_address = reservation.local_addr().expect("listener address");
-    drop(reservation);
+    let requested_address = SocketAddr::from(([127, 0, 0, 1], 0));
 
     let (events, mut event_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server_dir = dir.path().to_path_buf();
     let server = tokio::spawn(async move {
         run(
-            listener_address,
+            requested_address,
             server_dir,
             events,
             shutdown_rx,
@@ -979,7 +903,7 @@ async fn a_request_for_a_directory_is_answered_with_an_error() {
         .await
     });
 
-    wait_until_listening(&mut event_rx).await;
+    let listener_address = wait_until_listening(&mut event_rx).await;
 
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
     client
@@ -1005,18 +929,14 @@ async fn a_request_for_a_directory_is_answered_with_an_error() {
 async fn a_lost_oack_is_retransmitted_as_an_oack() {
     let dir = tempfile::tempdir().expect("temporary directory");
 
-    let reservation = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("reserve test port");
-    let listener_address = reservation.local_addr().expect("listener address");
-    drop(reservation);
+    let requested_address = SocketAddr::from(([127, 0, 0, 1], 0));
 
     let (events, mut event_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server_dir = dir.path().to_path_buf();
     let server = tokio::spawn(async move {
         run(
-            listener_address,
+            requested_address,
             server_dir,
             events,
             shutdown_rx,
@@ -1025,7 +945,7 @@ async fn a_lost_oack_is_retransmitted_as_an_oack() {
         .await
     });
 
-    wait_until_listening(&mut event_rx).await;
+    let listener_address = wait_until_listening(&mut event_rx).await;
 
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
     client
@@ -1087,22 +1007,6 @@ async fn a_lost_oack_is_retransmitted_as_an_oack() {
     server.await.expect("server task").expect("server result");
 }
 
-fn wrq_with_options(filename: &str, options: &[(&str, &str)]) -> Vec<u8> {
-    let mut request = Vec::new();
-    request.extend_from_slice(&2_u16.to_be_bytes());
-    request.extend_from_slice(filename.as_bytes());
-    request.push(0);
-    request.extend_from_slice(b"octet");
-    request.push(0);
-    for (key, value) in options {
-        request.extend_from_slice(key.as_bytes());
-        request.push(0);
-        request.extend_from_slice(value.as_bytes());
-        request.push(0);
-    }
-    request
-}
-
 #[tokio::test]
 async fn a_client_replaying_one_ack_cannot_hold_a_download_open() {
     let dir = tempfile::tempdir().expect("temporary directory");
@@ -1110,18 +1014,14 @@ async fn a_client_replaying_one_ack_cannot_hold_a_download_open() {
         .await
         .expect("test file");
 
-    let reservation = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("reserve test port");
-    let listener_address = reservation.local_addr().expect("listener address");
-    drop(reservation);
+    let requested_address = SocketAddr::from(([127, 0, 0, 1], 0));
 
     let (events, mut event_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server_dir = dir.path().to_path_buf();
     let server = tokio::spawn(async move {
         run(
-            listener_address,
+            requested_address,
             server_dir,
             events,
             shutdown_rx,
@@ -1133,7 +1033,7 @@ async fn a_client_replaying_one_ack_cannot_hold_a_download_open() {
         .await
     });
 
-    wait_until_listening(&mut event_rx).await;
+    let listener_address = wait_until_listening(&mut event_rx).await;
 
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
     client
@@ -1171,18 +1071,14 @@ async fn a_client_replaying_one_ack_cannot_hold_a_windowed_download_open() {
         .await
         .expect("test file");
 
-    let reservation = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("reserve test port");
-    let listener_address = reservation.local_addr().expect("listener address");
-    drop(reservation);
+    let requested_address = SocketAddr::from(([127, 0, 0, 1], 0));
 
     let (events, mut event_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server_dir = dir.path().to_path_buf();
     let server = tokio::spawn(async move {
         run(
-            listener_address,
+            requested_address,
             server_dir,
             events,
             shutdown_rx,
@@ -1195,7 +1091,7 @@ async fn a_client_replaying_one_ack_cannot_hold_a_windowed_download_open() {
         .await
     });
 
-    wait_until_listening(&mut event_rx).await;
+    let listener_address = wait_until_listening(&mut event_rx).await;
 
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
     client
@@ -1244,18 +1140,14 @@ async fn a_client_replaying_one_ack_cannot_hold_a_windowed_download_open() {
 async fn a_netascii_upload_ending_in_cr_keeps_that_byte() {
     let dir = tempfile::tempdir().expect("temporary directory");
 
-    let reservation = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("reserve test port");
-    let listener_address = reservation.local_addr().expect("listener address");
-    drop(reservation);
+    let requested_address = SocketAddr::from(([127, 0, 0, 1], 0));
 
     let (events, mut event_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server_dir = dir.path().to_path_buf();
     let server = tokio::spawn(async move {
         run(
-            listener_address,
+            requested_address,
             server_dir,
             events,
             shutdown_rx,
@@ -1264,7 +1156,7 @@ async fn a_netascii_upload_ending_in_cr_keeps_that_byte() {
         .await
     });
 
-    wait_until_listening(&mut event_rx).await;
+    let listener_address = wait_until_listening(&mut event_rx).await;
 
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
     let mut request = Vec::from(&2_u16.to_be_bytes()[..]);
@@ -1314,18 +1206,14 @@ async fn a_netascii_upload_ending_in_cr_keeps_that_byte() {
 async fn a_mid_transfer_timeout_never_repeats_the_oack() {
     let dir = tempfile::tempdir().expect("temporary directory");
 
-    let reservation = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("reserve test port");
-    let listener_address = reservation.local_addr().expect("listener address");
-    drop(reservation);
+    let requested_address = SocketAddr::from(([127, 0, 0, 1], 0));
 
     let (events, mut event_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server_dir = dir.path().to_path_buf();
     let server = tokio::spawn(async move {
         run(
-            listener_address,
+            requested_address,
             server_dir,
             events,
             shutdown_rx,
@@ -1334,7 +1222,7 @@ async fn a_mid_transfer_timeout_never_repeats_the_oack() {
         .await
     });
 
-    wait_until_listening(&mut event_rx).await;
+    let listener_address = wait_until_listening(&mut event_rx).await;
 
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
     client
@@ -1379,33 +1267,6 @@ async fn a_mid_transfer_timeout_never_repeats_the_oack() {
 
     shutdown_tx.send(true).expect("shutdown signal");
     let _ = server.await;
-}
-
-/// Start a server on a free loopback port and wait until it is listening.
-async fn start(
-    dir: &std::path::Path,
-    config: ServerConfig,
-) -> (
-    SocketAddr,
-    watch::Sender<bool>,
-    tokio::task::JoinHandle<anyhow::Result<()>>,
-    mpsc::UnboundedReceiver<ServerEvent>,
-) {
-    let reservation = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("reserve test port");
-    let listener_address = reservation.local_addr().expect("listener address");
-    drop(reservation);
-
-    let (events, mut event_rx) = mpsc::unbounded_channel();
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let server_dir = dir.to_path_buf();
-    let server = tokio::spawn(async move {
-        run(listener_address, server_dir, events, shutdown_rx, config).await
-    });
-
-    wait_until_listening(&mut event_rx).await;
-    (listener_address, shutdown_tx, server, event_rx)
 }
 
 #[tokio::test]
@@ -1736,29 +1597,6 @@ async fn a_windowed_upload_is_acknowledged_once_stored() {
     server.await.expect("server task").expect("server result");
 }
 
-/// Send DATA `block` carrying `payload` to `to`.
-async fn send_data(client: &UdpSocket, to: SocketAddr, block: u16, payload: &[u8]) {
-    let mut data = Vec::from(&3_u16.to_be_bytes()[..]);
-    data.extend_from_slice(&block.to_be_bytes());
-    data.extend_from_slice(payload);
-    client.send_to(&data, to).await.expect("DATA");
-}
-
-/// Wait for an ACK of `block`, skipping any ACK for an earlier one.
-async fn expect_ack(client: &UdpSocket, block: u16) {
-    let mut buffer = [0_u8; 616];
-    loop {
-        tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
-            .await
-            .unwrap_or_else(|_| panic!("no ACK {block}"))
-            .expect("datagram");
-        assert_eq!(&buffer[..2], &[0, 4], "expected an ACK");
-        if u16::from_be_bytes([buffer[2], buffer[3]]) == block {
-            return;
-        }
-    }
-}
-
 /// A windowed upload of eight-byte blocks, with a server that gives up after
 /// three retries.
 async fn start_windowed_upload(
@@ -2015,21 +1853,6 @@ async fn a_promoted_upload_leaves_its_staging_name_alone() {
 
     shutdown_tx.send(true).expect("shutdown signal");
     server.await.expect("server task").expect("server result");
-}
-
-/// Receive `count` DATA packets and return their block numbers.
-async fn receive_blocks(client: &UdpSocket, count: usize) -> Vec<u16> {
-    let mut buffer = [0_u8; 616];
-    let mut blocks = Vec::new();
-    for _ in 0..count {
-        tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
-            .await
-            .expect("DATA timeout")
-            .expect("datagram");
-        assert_eq!(&buffer[..2], &[0, 3]);
-        blocks.push(u16::from_be_bytes([buffer[2], buffer[3]]));
-    }
-    blocks
 }
 
 #[tokio::test]
